@@ -1,0 +1,21 @@
+# Secrets and credentials
+secrets.h
+
+# Build artifacts
+build/
+*.o
+*.elf
+*.bin
+*.hex
+
+# IDE files
+.vscode/
+*.code-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*~
