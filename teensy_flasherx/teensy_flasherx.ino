@@ -11,13 +11,14 @@
  ******************************************************************************/
 
 #include <Arduino.h>
+#include <Wire.h>
 #include "FlasherXOTA.h"
 #include "Telemetry.h"
 
 //******************************************************************************
 // Version Information
 //******************************************************************************
-#define FIRMWARE_VERSION "1.3.2"
+#define FIRMWARE_VERSION "1.3.8"
 #define BUILD_DATE       __DATE__ " " __TIME__
 
 //******************************************************************************
@@ -29,27 +30,20 @@
 
 // ----- STEERING POT (S1_WIPER) -----
 #define STEERING_POT_PIN      17      // Pin 17 (A3) - Steering potentiometer
-#define STEERING_POT_MIN      0       // Raw ADC value at full LEFT
-#define STEERING_POT_MAX      1023    // Raw ADC value at full RIGHT
-#define STEERING_POT_CENTER   512     // Raw ADC value at CENTER (neutral)
+#define STEERING_POT_MIN      105     // Raw ADC value at full LEFT
+#define STEERING_POT_MAX      708     // Raw ADC value at full RIGHT
+#define STEERING_POT_CENTER   407     // Raw ADC value at CENTER (neutral) = (105+708)/2
 #define STEERING_POT_DEADZONE 20      // Ignore values within +/- this of center
 
 // ----- THROTTLE POT (T1_WIPER) -----
 #define THROTTLE_POT_PIN      23      // Pin 23 (A9) - Throttle potentiometer
-#define THROTTLE_POT_MIN      100     // Raw ADC value at NO throttle (foot off)
-#define THROTTLE_POT_MAX      900     // Raw ADC value at FULL throttle
+#define THROTTLE_POT_MIN      249     // Raw ADC value at NO throttle (foot off)
+#define THROTTLE_POT_MAX      790     // Raw ADC value at FULL throttle
 #define THROTTLE_POT_DEADZONE 30      // Ignore small values (prevents creep)
 
-// ----- AS5600 MAGNETIC ENCODER -----
-// Can be read via I2C (Pin 18/19) OR analog output (Pin 16)
-#define ENCODER_USE_I2C       false   // true = I2C, false = Analog
+// ----- AS5600 MAGNETIC ENCODER (I2C ONLY) -----
 #define ENCODER_I2C_ADDR      0x36    // Default AS5600 I2C address
-#define ENCODER_ANALOG_PIN    16      // Pin 16 (A2) - AS5600 analog output
-#define ENCODER_MIN           0       // Encoder counts/ADC at minimum
-#define ENCODER_MAX           4095    // Encoder counts at maximum (12-bit I2C)
-#define ENCODER_CPR           4096    // Counts per revolution
-#define ENCODER_ANALOG_MIN    0       // Raw ADC at 0 degrees (analog mode)
-#define ENCODER_ANALOG_MAX    1023    // Raw ADC at 360 degrees (analog mode)
+#define ENCODER_CPR           4096    // Counts per revolution (12-bit = 4096)
 
 // ----- CURRENT SENSING -----
 // All current sense pins output 0-3.3V proportional to motor current
@@ -86,8 +80,8 @@
 #define PIN_REAR_CURRENT_R    39      // A15 - Rear Drive Current R
 
 // ===== DIGITAL INPUTS (3.3V Logic) =====
-#define PIN_SHIFTER_FWD       28      // Shifter Forward
-#define PIN_SHIFTER_REV       29      // Shifter Reverse
+#define PIN_SHIFTER_FWD       29      // Shifter Forward (swapped)
+#define PIN_SHIFTER_REV       28      // Shifter Reverse (swapped)
 #define PIN_MODE_SELECT       30      // Mode Select
 #define PIN_EBRAKE            31      // E-Brake Input
 
@@ -154,6 +148,16 @@ void setup() {
     // Initialize OTA update system
     OTA.begin(&Serial2, &Serial3, &Serial, FIRMWARE_VERSION, BUILD_DATE);
     
+    // Initialize I2C for AS5600 encoder
+    Wire.begin();
+    Wire.setClock(400000);  // 400 kHz I2C speed
+    Serial.println("I2C Initialized for AS5600 encoder (400 kHz)");
+    
+    // Scan I2C bus for devices
+    delay(100);
+    scanI2CBus();
+    delay(100);
+    
     // Initialize telemetry (sends to ESP32 via Serial3)
     Telem.begin(&Serial3, &Serial);
     Telem.setInterval(100);  // 100ms = 10Hz update rate
@@ -170,6 +174,44 @@ void setup() {
 }
 
 //******************************************************************************
+// setSteeringMotor() - Control steering motor based on steering input
+// steeringPercent: -100 to +100 (-100=full left, +100=full right)
+// calibrationMode: if true, use reduced speed for calibration
+//******************************************************************************
+void setSteeringMotor(int steeringPercent, bool calibrationMode = true) {
+    // Calibration mode: slow speed (20/255 ≈ 8%) for precise control
+    // Normal mode: full speed (255)
+    int maxSpeed = calibrationMode ? 20 : MOTOR_MAX_SPEED;
+    
+    // Convert percentage to PWM value
+    // steeringPercent ranges from -100 to +100
+    int pwmValue = (abs(steeringPercent) * maxSpeed) / 100;
+    
+    // Clamp to max
+    if (pwmValue > maxSpeed) pwmValue = maxSpeed;
+    
+    // Enable both steering motor drivers
+    digitalWrite(PIN_STEER_L_EN, HIGH);
+    digitalWrite(PIN_STEER_R_EN, HIGH);
+    
+    if (steeringPercent > 5) {
+        // Steer RIGHT: drive right PWM, left PWM off
+        analogWrite(PIN_STEER_RPWM, pwmValue);
+        analogWrite(PIN_STEER_LPWM, 0);
+        Serial.printf("PWM RIGHT: steerPct=%d, pin3=%d\n", steeringPercent, pwmValue);
+    } else if (steeringPercent < -5) {
+        // Steer LEFT: drive left PWM, right PWM off
+        analogWrite(PIN_STEER_LPWM, pwmValue);
+        analogWrite(PIN_STEER_RPWM, 0);
+        Serial.printf("PWM LEFT: steerPct=%d, pin2=%d\n", steeringPercent, pwmValue);
+    } else {
+        // CENTERED: all PWM off
+        analogWrite(PIN_STEER_LPWM, 0);
+        analogWrite(PIN_STEER_RPWM, 0);
+    }
+}
+
+//******************************************************************************
 // loop()
 //******************************************************************************
 void loop() {
@@ -183,7 +225,9 @@ void loop() {
     
     // Read all inputs and update telemetry data
     readInputs();
-    
+    // Print shifter status every loop
+    TelemetryData& td = Telem.data();
+    Serial.printf("Shifter:   %s\n", td.shifterFwd ? "FWD" : (td.shifterRev ? "REV" : "NEUTRAL"));
     // Run peripheral control logic
     updatePeripherals();
     
@@ -201,15 +245,130 @@ void loop() {
 }
 
 //******************************************************************************
-// readInputs() - Read all sensor inputs and update telemetry
+// scanI2CBus() - Scan for I2C devices on the bus
 //******************************************************************************
+void scanI2CBus() {
+    Serial.println("\n=== I2C Bus Scan ===");
+    delay(500);  // Give time to see the header
+    int found = 0;
+    
+    for (byte addr = 1; addr < 127; addr++) {
+        Wire.beginTransmission(addr);
+        byte error = Wire.endTransmission();
+        
+        if (error == 0) {
+            Serial.printf("  [0x%02X] Device found\n", addr);
+            delay(100);  // Slow down output so it's readable
+            found++;
+            
+            // If this is the AS5600 address, probe it
+            if (addr == ENCODER_I2C_ADDR) {
+                delay(200);
+                probeAS5600();
+                delay(200);
+            }
+        }
+    }
+    
+    delay(300);
+    if (found == 0) {
+        Serial.println("  NO DEVICES FOUND on I2C bus!");
+        Serial.println("  CHECK: SDA/SCL connections, pull-ups, power supply");
+    } else {
+        Serial.printf("  Total: %d device(s)\n", found);
+    }
+    Serial.println();
+    delay(500);
+}
+
+//******************************************************************************
+// probeAS5600() - Read AS5600 registers and display raw values
+//******************************************************************************
+void probeAS5600() {
+    Serial.println("\n--- AS5600 Register Probe ---");
+    
+    // Read status register (0x02)
+    Wire.beginTransmission(ENCODER_I2C_ADDR);
+    Wire.write(0x02);
+    Wire.endTransmission();
+    Wire.requestFrom(ENCODER_I2C_ADDR, 1);
+    
+    if (Wire.available()) {
+        uint8_t status = Wire.read();
+        Serial.printf("  Status Reg (0x02): 0x%02X\n", status);
+        Serial.printf("    MagnetDetected: %s\n", (status & 0x20) ? "NO" : "YES");
+        Serial.printf("    MagnetTooWeak:  %s\n", (status & 0x10) ? "YES" : "NO");
+        Serial.printf("    MagnetTooStrong:%s\n", (status & 0x08) ? "YES" : "NO");
+    } else {
+        Serial.println("  ERROR: Cannot read Status register");
+        return;
+    }
+    
+    // Read angle registers (0x0E = MSB, 0x0F = LSB)
+    Wire.beginTransmission(ENCODER_I2C_ADDR);
+    Wire.write(0x0E);
+    Wire.endTransmission();
+    Wire.requestFrom(ENCODER_I2C_ADDR, 2);
+    
+    if (Wire.available() >= 2) {
+        uint16_t rawAngle = (Wire.read() << 8) | Wire.read();
+        uint16_t angleDeg = (rawAngle * 360) / 4096;
+        Serial.printf("  Angle Raw (0x0E/0x0F): %4d counts = %3d degrees\n", rawAngle, angleDeg);
+    } else {
+        Serial.println("  ERROR: Cannot read Angle registers");
+    }
+    
+    Serial.println();
+}
+
+//******************************************************************************
+// readAS5600Angle() - Read AS5600 angle via I2C
+//******************************************************************************
+void readAS5600Angle(TelemetryData& td) {
+    // AS5600 stores angle in registers 0x0E (MSB) and 0x0F (LSB)
+    // Full 12-bit angle value = (MSB << 8) | LSB
+    // 4096 counts = 360 degrees, so angle_degrees = (counts / 4096) * 360
+    
+    static bool i2cErrorReported = false;
+    
+    Wire.beginTransmission(ENCODER_I2C_ADDR);
+    Wire.write(0x0E);  // Angle register MSB
+    byte error = Wire.endTransmission();
+    
+    if (error != 0) {
+        if (!i2cErrorReported) {
+            Serial.printf("I2C Error on transmission: %d (will not repeat)\n", error);
+            i2cErrorReported = true;
+        }
+        td.encoderAngle = 0;
+        return;
+    }
+    
+    Wire.requestFrom(ENCODER_I2C_ADDR, 2);
+    if (Wire.available() >= 2) {
+        uint16_t rawAngle = (Wire.read() << 8) | Wire.read();
+        // Convert 12-bit count (0-4095) to degrees (0-359)
+        td.encoderAngle = (rawAngle * 360) / 4096;
+        i2cErrorReported = false;  // Reset flag when communication works
+    } else {
+        if (!i2cErrorReported) {
+            Serial.printf("I2C Error: No data from AS5600 (available: %d bytes)\n", Wire.available());
+            i2cErrorReported = true;
+        }
+        td.encoderAngle = 0;  // Error reading
+    }
+}
+
+// ...existing code...
 void readInputs() {
     TelemetryData& td = Telem.data();
     
     // Read analog inputs
     td.steeringRaw = analogRead(PIN_STEERING_POT);
     td.throttleRaw = analogRead(PIN_THROTTLE_POT);
-    td.encoderRaw = analogRead(PIN_AS5600_ANALOG);
+    
+    // Read AS5600 angle via I2C
+    readAS5600Angle(td);
     
     // Read current sensors
     td.steerCurrentL = analogRead(PIN_STEER_CURRENT_L);  // TODO: Convert to mA
@@ -219,9 +378,15 @@ void readInputs() {
     td.rearCurrentL = analogRead(PIN_REAR_CURRENT_L);
     td.rearCurrentR = analogRead(PIN_REAR_CURRENT_R);
     
-    // Read digital inputs (active low with pullup, so invert)
-    td.shifterFwd = !digitalRead(PIN_SHIFTER_FWD);
-    td.shifterRev = !digitalRead(PIN_SHIFTER_REV);
+    // Read digital inputs (active low with pullup)
+    // Shifter: ground pulls pin LOW when activated, both HIGH = neutral
+    int fwdPin = digitalRead(PIN_SHIFTER_FWD);  // LOW=0 when activated, HIGH=1 when not
+    int revPin = digitalRead(PIN_SHIFTER_REV);  // LOW=0 when activated, HIGH=1 when not
+    td.shifterFwd = (fwdPin == LOW);   // Forward: FWD pin is pulled LOW
+    td.shifterRev = (revPin == LOW);   // Reverse: REV pin is pulled LOW
+    // Note: Neutral = both pins HIGH (shifterFwd==false AND shifterRev==false)
+    
+    // Other digital inputs (inverted logic for non-shifter)
     td.modeSelect = !digitalRead(PIN_MODE_SELECT);
     td.eBrake = !digitalRead(PIN_EBRAKE);
     
@@ -310,13 +475,12 @@ void initPeripherals() {
 // updatePeripherals() - Main peripheral control loop
 //******************************************************************************
 void updatePeripherals() {
-    // TODO: Add your peripheral control logic here
-    // This runs every loop iteration
-    // Examples:
-    // - Read joystick/controller input
-    // - Update motor speeds
-    // - Update LED animations
-    // - Check safety sensors
+    TelemetryData& td = Telem.data();
+    
+    // CALIBRATION MODE: Drive steering motor based on steering input
+    // User rotates steering wheel and watches encoder angle output
+    // This helps find the center position for alignment
+    setSteeringMotor(td.steeringPercent, true);  // true = calibration mode (slow speed)
 }
 
 //******************************************************************************
@@ -382,7 +546,7 @@ void printPeripheralStatus() {
     Serial.println("--- Inputs ---");
     Serial.printf("  Steering:  %4d raw  %4d%%\n", td.steeringRaw, td.steeringPercent);
     Serial.printf("  Throttle:  %4d raw  %4d%%\n", td.throttleRaw, td.throttlePercent);
-    Serial.printf("  Encoder:   %4d raw\n", td.encoderRaw);
+    Serial.printf("  Encoder:   %3d deg\n", td.encoderAngle);
     Serial.printf("  Shifter:   %s\n", td.shifterFwd ? "FWD" : (td.shifterRev ? "REV" : "NEUTRAL"));
     Serial.printf("  Mode:      %s\n", td.modeSelect ? "ON" : "OFF");
     Serial.printf("  E-Brake:   %s\n", td.eBrake ? "ENGAGED" : "OFF");

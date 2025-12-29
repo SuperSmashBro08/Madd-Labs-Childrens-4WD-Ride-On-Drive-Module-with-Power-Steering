@@ -23,7 +23,7 @@ struct TelemetryData {
     // Inputs
     int16_t steeringRaw;      // Raw steering pot value (0-1023)
     int16_t throttleRaw;      // Raw throttle pot value (0-1023)
-    int16_t encoderRaw;       // Raw encoder value (0-4095)
+    uint16_t encoderAngle;    // AS5600 angle in degrees (0-359)
     
     // Processed inputs (-100 to +100 or 0-100)
     int8_t steeringPercent;   // -100 (left) to +100 (right)

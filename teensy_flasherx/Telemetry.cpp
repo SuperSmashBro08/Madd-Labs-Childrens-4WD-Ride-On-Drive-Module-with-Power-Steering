@@ -104,7 +104,7 @@ void Telemetry::sendCompact() {
     // Raw inputs (5 chars each, right-aligned)
     printInt(_data.steeringRaw, 5);
     printInt(_data.throttleRaw, 5);
-    printInt(_data.encoderRaw, 5);
+    printInt(_data.encoderAngle, 5);
     _telemSerial->print(" | ");
     
     // Processed (-100 to +100, 6 chars with sign)
@@ -166,7 +166,7 @@ void Telemetry::sendVerbose() {
     _telemSerial->print("  Throttle=");
     printInt(_data.throttleRaw, 5);
     _telemSerial->print("  Encoder=");
-    printInt(_data.encoderRaw, 5);
+    printInt(_data.encoderAngle, 5);
     _telemSerial->println();
     
     _telemSerial->print("CONTROL: Steer=");

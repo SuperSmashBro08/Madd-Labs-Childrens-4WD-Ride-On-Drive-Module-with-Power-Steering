@@ -29,7 +29,7 @@ const char* password = WIFI_PASSWORD;
 // ============================================
 // Version Information
 // ============================================
-#define ESP_FIRMWARE_VERSION "1.2.5"
+#define ESP_FIRMWARE_VERSION "1.2.6"
 #define ESP_BUILD_DATE __DATE__ " " __TIME__
 String teensyVersion = "Unknown";
 
