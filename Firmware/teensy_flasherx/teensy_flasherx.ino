@@ -18,7 +18,7 @@
 //******************************************************************************
 // Version Information
 //******************************************************************************
-#define FIRMWARE_VERSION "1.5.6"
+#define FIRMWARE_VERSION "1.5.8"
 #define BUILD_DATE       __DATE__ " " __TIME__
 
 //******************************************************************************
@@ -62,13 +62,13 @@
 // 1. Set ENCODER_ANGLE_OFFSET to 0 temporarily
 // 2. Upload firmware and open serial monitor
 // 3. Steer wheels to STRAIGHT (center) position
-// 4. Read the raw encoder angle displayed (e.g., 53°)
-// 5. Calculate offset: ENCODER_ANGLE_OFFSET = 180 - raw_angle
-//    Example: If raw reads 53°, offset = 180 - 53 = 127
+// 4. Read the raw encoder angle displayed (e.g., 233°)
+// 5. Calculate offset: ENCODER_ANGLE_OFFSET = (180 - raw_angle + 360) % 360
+//    Example: If raw reads 233°, offset = (180 - 233 + 360) % 360 = 307
 // 6. Set ENCODER_ANGLE_OFFSET to your calculated value
 // 7. After upload, center should now display 180°
 //
-#define ENCODER_ANGLE_OFFSET  127     // Offset to make center read 180° (180 - your_raw_center)
+#define ENCODER_ANGLE_OFFSET  307     // Offset to make center read 180° (raw 233° + 307 = 540 % 360 = 180°)
 
 // ----- CURRENT SENSING -----
 // All current sense pins output 0-3.3V proportional to motor current

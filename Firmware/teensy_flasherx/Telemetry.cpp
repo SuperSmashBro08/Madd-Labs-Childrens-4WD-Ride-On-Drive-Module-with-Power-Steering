@@ -86,9 +86,9 @@ void Telemetry::printHeader() {
         // Fixed-width header matching data columns
         // Each column has specific width for alignment
         _telemSerial->println();
-        _telemSerial->println("|------- RAW INPUTS ------|--- PROCESSED (%) ---|-- PWM OUTPUTS --|---------- CURRENT (mA) ---------|SOURCE|-- SYS --|");
-        _telemSerial->println("| Steer Throt Str2  Thr2  Encdr | Steer Throt Str2  Thr2  | StL  StR  FrL  FrR  ReL  ReR| StL   StR   FrL   FrR   ReL   ReR|      | Loop  T |");
-        _telemSerial->println("|---------------------------|--------------------------|------------------------------|----------------------------------|------|---------|");
+        _telemSerial->println("|------- RAW INPUTS ------|--- PROCESSED (%) ---|-- DRIVE % --|------ CURRENT (A) ------|SOURCE|-- SYS --||");
+        _telemSerial->println("| Steer Throt Str2  Thr2  Encdr | Steer Throt Str2  Thr2  | FrL  FrR  ReL  ReR| FrL   FrR   ReL   ReR  |      | Loop  T ||");
+        _telemSerial->println("|---------------------------|--------------------------|-------------------|-------------------------|------|---------||");
     }
 }
 
@@ -119,33 +119,30 @@ void Telemetry::sendCompact() {
     printInt(_data.throttle2Percent, 5);
     _telemSerial->print("% | ");
     
-    // PWM outputs (4 chars each, 0-255)
-    printUInt(_data.steerPwmL, 4);
-    _telemSerial->print(" ");
-    printUInt(_data.steerPwmR, 4);
-    _telemSerial->print(" ");
-    printUInt(_data.frontPwmL, 4);
-    _telemSerial->print(" ");
-    printUInt(_data.frontPwmR, 4);
-    _telemSerial->print(" ");
-    printUInt(_data.rearPwmL, 4);
-    _telemSerial->print(" ");
-    printUInt(_data.rearPwmR, 4);
-    _telemSerial->print(" | ");
+    // Drive PWM outputs as percentage (0-100%)
+    int frontLPct = (_data.frontPwmL * 100) / 255;
+    int frontRPct = (_data.frontPwmR * 100) / 255;
+    int rearLPct = (_data.rearPwmL * 100) / 255;
+    int rearRPct = (_data.rearPwmR * 100) / 255;
+    printUInt(frontLPct, 3);
+    _telemSerial->print("% ");
+    printUInt(frontRPct, 3);
+    _telemSerial->print("% ");
+    printUInt(rearLPct, 3);
+    _telemSerial->print("% ");
+    printUInt(rearRPct, 3);
+    _telemSerial->print("% | ");
     
-    // Current (5 chars each, mA)
-    printUInt(_data.steerCurrentL, 5);
-    _telemSerial->print(" ");
-    printUInt(_data.steerCurrentR, 5);
-    _telemSerial->print(" ");
-    printUInt(_data.frontCurrentL, 5);
-    _telemSerial->print(" ");
-    printUInt(_data.frontCurrentR, 5);
-    _telemSerial->print(" ");
-    printUInt(_data.rearCurrentL, 5);
-    _telemSerial->print(" ");
-    printUInt(_data.rearCurrentR, 5);
-    _telemSerial->print(" | ");
+    // Current in Amps (divide raw ADC by scale factor, display with 1 decimal)
+    // Raw ADC 0-1023 maps to current - showing as X.X A format
+    _telemSerial->print(_data.frontCurrentL / 100.0, 1);
+    _telemSerial->print("A ");
+    _telemSerial->print(_data.frontCurrentR / 100.0, 1);
+    _telemSerial->print("A ");
+    _telemSerial->print(_data.rearCurrentL / 100.0, 1);
+    _telemSerial->print("A ");
+    _telemSerial->print(_data.rearCurrentR / 100.0, 1);
+    _telemSerial->print("A | ");
     
     // Control Source
     _telemSerial->print(" ");
