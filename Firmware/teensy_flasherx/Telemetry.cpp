@@ -86,9 +86,9 @@ void Telemetry::printHeader() {
         // Fixed-width header matching data columns
         // Each column has specific width for alignment
         _telemSerial->println();
-        _telemSerial->println("|----- INPUTS -----|--- PROCESSED ---|-- DIGITAL --|-------- PWM OUTPUTS --------|---------- CURRENT (mA) ---------|-- SYS --|");
-        _telemSerial->println("| Steer Throt Encdr| Steer%  Throt%  | F R M E     | StL  StR  FrL  FrR  ReL  ReR| StL   StR   FrL   FrR   ReL   ReR| Loop  T |");
-        _telemSerial->println("|------------------|-----------------|-------------|------------------------------|----------------------------------|---------|");
+        _telemSerial->println("|------- RAW INPUTS ------|--- PROCESSED (%) ---|-- PWM OUTPUTS --|---------- CURRENT (mA) ---------|SOURCE|-- SYS --|");
+        _telemSerial->println("| Steer Throt Str2  Thr2  Encdr | Steer Throt Str2  Thr2  | StL  StR  FrL  FrR  ReL  ReR| StL   StR   FrL   FrR   ReL   ReR|      | Loop  T |");
+        _telemSerial->println("|---------------------------|--------------------------|------------------------------|----------------------------------|------|---------|");
     }
 }
 
@@ -97,28 +97,27 @@ void Telemetry::printHeader() {
 //******************************************************************************
 void Telemetry::sendCompact() {
     // Format: Fixed width columns for perfect alignment
-    // Steer(5) Throt(5) Encdr(5) | Steer%(5) Throt%(5) | F R M E | PWM x6 | Current x6 | Loop Temp
+    // Steer(5) Throt(5) Steer2(5) Throt2(5) Encdr(5) | Steer%(5) Throt%(5) Steer2%(5) Throt2%(5) | PWM x6 | Current x6 | Loop Temp
     
     _telemSerial->print("| ");
     
     // Raw inputs (5 chars each, right-aligned)
     printInt(_data.steeringRaw, 5);
     printInt(_data.throttleRaw, 5);
+    printInt(_data.steer2Raw, 5);
+    printInt(_data.throttle2Raw, 5);
     printInt(_data.encoderAngle, 5);
     _telemSerial->print(" | ");
     
-    // Processed (-100 to +100, 6 chars with sign)
-    printInt(_data.steeringPercent, 6);
+    // Processed (-100 to +100, 5 chars with sign)
+    printInt(_data.steeringPercent, 5);
     _telemSerial->print("% ");
     printInt(_data.throttlePercent, 5);
+    _telemSerial->print("% ");
+    printInt(_data.steer2Percent, 5);
+    _telemSerial->print("% ");
+    printInt(_data.throttle2Percent, 5);
     _telemSerial->print("% | ");
-    
-    // Digital inputs (single char each)
-    _telemSerial->print(_data.shifterFwd ? "F " : ". ");
-    _telemSerial->print(_data.shifterRev ? "R " : ". ");
-    _telemSerial->print(_data.modeSelect ? "M " : ". ");
-    _telemSerial->print(_data.eBrake     ? "E " : ". ");
-    _telemSerial->print("    | ");
     
     // PWM outputs (4 chars each, 0-255)
     printUInt(_data.steerPwmL, 4);
@@ -146,6 +145,17 @@ void Telemetry::sendCompact() {
     printUInt(_data.rearCurrentL, 5);
     _telemSerial->print(" ");
     printUInt(_data.rearCurrentR, 5);
+    _telemSerial->print(" | ");
+    
+    // Control Source
+    _telemSerial->print(" ");
+    if (_data.controlSource == 1) {
+        _telemSerial->print("Car  ");
+    } else if (_data.controlSource == 2) {
+        _telemSerial->print("Remot");
+    } else {
+        _telemSerial->print("????");
+    }
     _telemSerial->print(" | ");
     
     // System (loop time in us, temp)

@@ -1,179 +1,180 @@
-// ===== FRONT & STEER MOTOR DRIVERS: FWD/REV + Pedal on Teensy 4.1 =====
-// BTS7960-style drivers
+/*******************************************************************************
+ * Teensy 4.1 Motor Driver Test - V2.1 PCB
+ * 
+ * Tests all 3 motor drivers (Steering, Front, Rear) together
+ * Throttle pot = motor speed (0-100%)
+ * Shifter = direction (FWD / REV / NEUTRAL)
+ * 
+ * Pure Teensy code - NO OTA, NO I2C, NO Telemetry
+ ******************************************************************************/
 
-// -------- FRONT motor driver pins --------
-const int PIN_R_EN  = 11;
-const int PIN_L_EN  = 10;
-const int PIN_R_PWM = 9;   // FRONT, one direction
-const int PIN_L_PWM = 6;   // FRONT, other direction
+#include <Arduino.h>
 
-// -------- STEER motor driver pins --------
-const int PIN_R2_EN  = 5;  // STEER R_EN (through level shifter)
-const int PIN_L2_EN  = 4;  // STEER L_EN (through level shifter)
-const int PIN_R2_PWM = 3;   // STEER, one direction (reverse)
-const int PIN_L2_PWM = 2;   // STEER, other direction (forward)
+//====== PIN DEFINITIONS ======
 
-// -------- Inputs --------
-const int PIN_PEDAL = 23;   // A13 foot pedal
-const int PIN_FWD   = 28;   // Shifter FORWARD contact (to GND when forward)
-const int PIN_REV   = 29;   // Shifter REVERSE contact (to GND when reverse)
+// Throttle input
+#define PIN_THROTTLE 23
 
-// -------- Pedal calibration --------
-// 100 is your "off" point.
-// We'll use a small deadband above it and map up to ~900.
-const int PEDAL_RAW_MIN   = 100;  // raw at "off"
-const int PEDAL_DEADBAND  = 30;    // small deadband above min
-const int PEDAL_RAW_MAX   = 900;  // raw at full pedal
+// Shifter inputs (active LOW)
+#define PIN_FWD 29
+#define PIN_REV 28
 
-// Map pedal raw reading to 0..255 PWM
-int computePedalPWM(int raw)
-{
-  // Below off+deadband → force 0
-  if (raw <= PEDAL_RAW_MIN + PEDAL_DEADBAND) {
-    return 0;
-  }
+// Steering motor
+#define PIN_STEER_LPWM 2
+#define PIN_STEER_RPWM 3
+#define PIN_STEER_L_EN 4
+#define PIN_STEER_R_EN 5
 
-  // Clamp into [PEDAL_RAW_MIN, PEDAL_RAW_MAX]
-  if (raw < PEDAL_RAW_MIN) raw = PEDAL_RAW_MIN;
-  if (raw > PEDAL_RAW_MAX) raw = PEDAL_RAW_MAX;
+// Front motor
+#define PIN_FRONT_LPWM 6
+#define PIN_FRONT_RPWM 9
+#define PIN_FRONT_L_EN 10
+#define PIN_FRONT_R_EN 11
 
-  // Map from (min+deadband .. max) → 0..255
-  int pwm = map(raw,
-                PEDAL_RAW_MIN + PEDAL_DEADBAND,
-                PEDAL_RAW_MAX,
-                0,
-                255);
+// Rear motor
+#define PIN_REAR_LPWM 12
+#define PIN_REAR_RPWM 13
+#define PIN_REAR_L_EN 32
+#define PIN_REAR_R_EN 33
 
-  if (pwm < 0)   pwm = 0;
-  if (pwm > 255) pwm = 255;
-  return pwm;
-}
+//====== THROTTLE CALIBRATION ======
+#define THROTTLE_MIN 249
+#define THROTTLE_MAX 790
+#define THROTTLE_DEADZONE 30
 
-void setup()
-{
-  Serial.begin(115200);
-  delay(300);
-  Serial.println();
-  Serial.println(F("=== FRONT+Steer MOTOR: Pedal + FWD/REV (11 & 12, PWM 13/22 & 2/3) ==="));
-
-  // ---- FRONT motor driver pins ----
-  pinMode(PIN_R_EN,  OUTPUT);
-  pinMode(PIN_L_EN,  OUTPUT);
-  pinMode(PIN_R_PWM, OUTPUT);
-  pinMode(PIN_L_PWM, OUTPUT);
-
-  digitalWrite(PIN_R_EN, HIGH);
-  digitalWrite(PIN_L_EN, HIGH);
-
-  analogWrite(PIN_R_PWM, 0);
-  analogWrite(PIN_L_PWM, 0);
-
-  // ---- STEER motor driver pins ----
-  pinMode(PIN_R2_EN,  OUTPUT);
-  pinMode(PIN_L2_EN,  OUTPUT);
-  pinMode(PIN_R2_PWM, OUTPUT);
-  pinMode(PIN_L2_PWM, OUTPUT);
-
-  // Enable both sides of Steer BTS7960 (through level shifter)
-  digitalWrite(PIN_R2_EN, HIGH);
-  digitalWrite(PIN_L2_EN, HIGH);
-
-  analogWrite(PIN_R2_PWM, 0);
-  analogWrite(PIN_L2_PWM, 0);
-
-  // ---- Shifter inputs ----
-  // Internal pullups: HIGH when idle, LOW when switch connects to GND.
-  pinMode(PIN_FWD, INPUT_PULLUP);
-  pinMode(PIN_REV, INPUT_PULLUP);
-
-  // ---- ADC setup for pedal ----
-  analogReadResolution(12);  // 0..4095
-  analogReadAveraging(8);
-
-  // ---- PWM frequency on motor pins ----
-  analogWriteFrequency(PIN_R_PWM,  20000);
-  analogWriteFrequency(PIN_L_PWM,  20000);
-  analogWriteFrequency(PIN_R2_PWM, 20000);
-  analogWriteFrequency(PIN_L2_PWM, 20000);
-}
-
-void loop()
-{
-  // ----- Pedal read -----
-  int rawPedal = analogRead(PIN_PEDAL);
-  int pwm = computePedalPWM(rawPedal);
-
-  // ----- Shifter read (LOW = active) -----
-  int rawFwd = digitalRead(PIN_FWD); // 0 = forward selected
-  int rawRev = digitalRead(PIN_REV); // 0 = reverse selected
-
-  enum GearState { GEAR_NEUTRAL, GEAR_FORWARD, GEAR_REVERSE };
-  GearState gear = GEAR_NEUTRAL;
-
-  // Logic with INPUT_PULLUP:
-  //   Forward: FWD LOW, REV HIGH
-  //   Reverse: FWD HIGH, REV LOW
-  //   Neutral: anything else (both HIGH or both LOW)
-  if (rawFwd == LOW && rawRev == HIGH) {
-    gear = GEAR_FORWARD;
-  } else if (rawFwd == HIGH && rawRev == LOW) {
-    gear = GEAR_REVERSE;
-  } else {
-    gear = GEAR_NEUTRAL;
-  }
-
-  // ----- Apply motor outputs (FRONT + Steer) -----
-  switch (gear) {
-    case GEAR_FORWARD:
-      // Forward direction:
-      //   FRONT:  L_PWM (13)
-      //   STEER:   L2_PWM (2)
-      analogWrite(PIN_L_PWM,  pwm);
-      analogWrite(PIN_R_PWM,  0);
-      analogWrite(PIN_L2_PWM, pwm);
-      analogWrite(PIN_R2_PWM, 0);
-      break;
-
-    case GEAR_REVERSE:
-      // Reverse direction:
-      //   FRONT:  R_PWM (22)
-      //   STEER:   R2_PWM (3)
-      analogWrite(PIN_L_PWM,  0);
-      analogWrite(PIN_R_PWM,  pwm);
-      analogWrite(PIN_L2_PWM, 0);
-      analogWrite(PIN_R2_PWM, pwm);
-      break;
-
-    case GEAR_NEUTRAL:
-    default:
-      // All off
-      analogWrite(PIN_R_PWM,  0);
-      analogWrite(PIN_L_PWM,  0);
-      analogWrite(PIN_R2_PWM, 0);
-      analogWrite(PIN_L2_PWM, 0);
-      break;
-  }
-
-  // ----- Debug print -----
-  static uint32_t lastPrint = 0;
-  uint32_t now = millis();
-  if (now - lastPrint >= 200) {
-    lastPrint = now;
-
-    Serial.print(F("rawPedal="));
-    Serial.print(rawPedal);
-    Serial.print(F(" pwm="));
-    Serial.print(pwm);
-
-    Serial.print(F("  rawFwd="));
-    Serial.print(rawFwd);
-    Serial.print(F(" rawRev="));
-    Serial.print(rawRev);
-    Serial.print(F(" gear="));
-    if (gear == GEAR_FORWARD)      Serial.print("FORWARD");
-    else if (gear == GEAR_REVERSE) Serial.print("REVERSE");
-    else                           Serial.print("NEUTRAL");
-
+//====== SETUP ======
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+    
+    Serial.println("\n========================================");
+    Serial.println("  MOTOR DRIVER TEST - Teensy 4.1");
+    Serial.println("========================================");
+    Serial.println("3 Motors: Steering, Front, Rear");
+    Serial.println("Throttle = Speed (0-100%)");
+    Serial.println("Shifter = Direction (FWD/REV/NEUTRAL)");
     Serial.println();
-  }
+    
+    // Configure shifter inputs
+    pinMode(PIN_FWD, INPUT_PULLUP);
+    pinMode(PIN_REV, INPUT_PULLUP);
+    
+    // Configure all enable pins
+    pinMode(PIN_STEER_L_EN, OUTPUT);
+    pinMode(PIN_STEER_R_EN, OUTPUT);
+    pinMode(PIN_FRONT_L_EN, OUTPUT);
+    pinMode(PIN_FRONT_R_EN, OUTPUT);
+    pinMode(PIN_REAR_L_EN, OUTPUT);
+    pinMode(PIN_REAR_R_EN, OUTPUT);
+    
+    // Configure all PWM pins
+    pinMode(PIN_STEER_LPWM, OUTPUT);
+    pinMode(PIN_STEER_RPWM, OUTPUT);
+    pinMode(PIN_FRONT_LPWM, OUTPUT);
+    pinMode(PIN_FRONT_RPWM, OUTPUT);
+    pinMode(PIN_REAR_LPWM, OUTPUT);
+    pinMode(PIN_REAR_RPWM, OUTPUT);
+    
+    // Set PWM frequency
+    analogWriteFrequency(PIN_STEER_LPWM, 20000);
+    analogWriteFrequency(PIN_STEER_RPWM, 20000);
+    analogWriteFrequency(PIN_FRONT_LPWM, 20000);
+    analogWriteFrequency(PIN_FRONT_RPWM, 20000);
+    analogWriteFrequency(PIN_REAR_LPWM, 20000);
+    analogWriteFrequency(PIN_REAR_RPWM, 20000);
+    
+    // All motors off initially
+    allMotorsOff();
+    
+    Serial.println("Ready. Move throttle and shifter to test...\n");
+}
+
+//====== MAIN LOOP ======
+void loop() {
+    // Read throttle
+    int throttleRaw = analogRead(PIN_THROTTLE);
+    int throttlePercent = 0;
+    
+    if (throttleRaw > THROTTLE_MIN + THROTTLE_DEADZONE) {
+        throttlePercent = map(throttleRaw, 
+                              THROTTLE_MIN + THROTTLE_DEADZONE,
+                              THROTTLE_MAX, 
+                              0, 100);
+        throttlePercent = constrain(throttlePercent, 0, 100);
+    }
+    
+    // Convert to PWM (0-255)
+    int pwmValue = map(throttlePercent, 0, 100, 0, 255);
+    
+    // Read shifter (active LOW)
+    bool isFwd = (digitalRead(PIN_FWD) == LOW);
+    bool isRev = (digitalRead(PIN_REV) == LOW);
+    
+    // Determine gear
+    int gear = 0;  // 0=NEUTRAL, 1=FORWARD, 2=REVERSE
+    if (isFwd) gear = 1;
+    else if (isRev) gear = 2;
+    
+    // Apply motor control
+    driveAllMotors(gear, pwmValue);
+    
+    // Print every 200ms
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint >= 200) {
+        lastPrint = millis();
+        
+        const char* gearStr = (gear == 1) ? "FWD" : (gear == 2) ? "REV" : "NEU";
+        Serial.printf("Throttle: %3d%% (raw=%3d) | PWM: %3d | Gear: %s | FWD_pin: %d | REV_pin: %d | EN_pins: L_EN=%d R_EN=%d\n",
+                     throttlePercent, throttleRaw, pwmValue, gearStr,
+                     digitalRead(PIN_FWD), digitalRead(PIN_REV),
+                     digitalRead(PIN_STEER_L_EN), digitalRead(PIN_STEER_R_EN));
+    }
+}
+
+//====== DRIVE ALL MOTORS ======
+void driveAllMotors(int gear, int pwmValue) {
+    // Enable all drivers
+    digitalWrite(PIN_STEER_L_EN, HIGH);
+    digitalWrite(PIN_STEER_R_EN, HIGH);
+    digitalWrite(PIN_FRONT_L_EN, HIGH);
+    digitalWrite(PIN_FRONT_R_EN, HIGH);
+    digitalWrite(PIN_REAR_L_EN, HIGH);
+    digitalWrite(PIN_REAR_R_EN, HIGH);
+    
+    if (pwmValue == 0) {
+        // No throttle - all off
+        allMotorsOff();
+    } 
+    else if (gear == 1) {
+        // FORWARD - apply to L_PWM pins
+        analogWrite(PIN_STEER_LPWM, pwmValue);
+        analogWrite(PIN_STEER_RPWM, 0);
+        analogWrite(PIN_FRONT_LPWM, pwmValue);
+        analogWrite(PIN_FRONT_RPWM, 0);
+        analogWrite(PIN_REAR_LPWM, pwmValue);
+        analogWrite(PIN_REAR_RPWM, 0);
+    } 
+    else if (gear == 2) {
+        // REVERSE - apply to R_PWM pins
+        analogWrite(PIN_STEER_LPWM, 0);
+        analogWrite(PIN_STEER_RPWM, pwmValue);
+        analogWrite(PIN_FRONT_LPWM, 0);
+        analogWrite(PIN_FRONT_RPWM, pwmValue);
+        analogWrite(PIN_REAR_LPWM, 0);
+        analogWrite(PIN_REAR_RPWM, pwmValue);
+    } 
+    else {
+        // NEUTRAL - all off
+        allMotorsOff();
+    }
+}
+
+//====== ALL MOTORS OFF ======
+void allMotorsOff() {
+    analogWrite(PIN_STEER_LPWM, 0);
+    analogWrite(PIN_STEER_RPWM, 0);
+    analogWrite(PIN_FRONT_LPWM, 0);
+    analogWrite(PIN_FRONT_RPWM, 0);
+    analogWrite(PIN_REAR_LPWM, 0);
+    analogWrite(PIN_REAR_RPWM, 0);
 }

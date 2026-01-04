@@ -20,20 +20,29 @@
 // Telemetry Data Structure
 //******************************************************************************
 struct TelemetryData {
-    // Inputs
+    // Inputs - Throttle1 (steering wheel + pedal)
     int16_t steeringRaw;      // Raw steering pot value (0-1023)
     int16_t throttleRaw;      // Raw throttle pot value (0-1023)
     uint16_t encoderAngle;    // AS5600 angle in degrees (0-359)
     
+    // Inputs - RC (steer2 + throttle2)
+    int16_t steer2Raw;        // Raw RC steering value (0-1023)
+    int16_t throttle2Raw;     // Raw RC throttle value (0-1023)
+    
     // Processed inputs (-100 to +100 or 0-100)
     int8_t steeringPercent;   // -100 (left) to +100 (right)
     int8_t throttlePercent;   // 0 to 100
+    int8_t steer2Percent;     // -100 (left) to +100 (right) - RC
+    int8_t throttle2Percent;  // 0 to 100 - RC
     
     // Digital inputs
     bool shifterFwd;          // Forward gear
     bool shifterRev;          // Reverse gear
     bool modeSelect;          // Mode switch state
     bool eBrake;              // E-brake engaged
+    
+    // Control source
+    uint8_t controlSource;    // 1=Car (steering wheel), 2=Remote (RC receiver)
     
     // Motor outputs (0-255 PWM)
     uint8_t steerPwmL;        // Steering left PWM
