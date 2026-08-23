@@ -18,7 +18,7 @@
 //******************************************************************************
 // Version Information
 //******************************************************************************
-#define FIRMWARE_VERSION "1.8.10"
+#define FIRMWARE_VERSION "1.8.11"
 #define BUILD_DATE       __DATE__ " " __TIME__
 
 //******************************************************************************
@@ -58,6 +58,8 @@
 #define ENCODER_I2C_ADDR      0x36    // Default AS5600 I2C address
 #define ENCODER_CPR           4096    // Counts per revolution (12-bit = 4096)
 #define ENCODER_VALID_READS_REQUIRED 3 // Require consecutive good reads before steering is enabled
+#define ENCODER_FAULT_CONFIRM_FAILURES 3 // Consecutive failures required before latching a shutdown fault
+#define ENCODER_FAULT_NO_DATA 6      // Application fault code: AS5600 transaction succeeded but angle bytes were missing
 //
 // HOW TO CALIBRATE ENCODER_ANGLE_OFFSET:
 // 1. Set ENCODER_ANGLE_OFFSET to 0 temporarily
@@ -183,10 +185,13 @@ int rolloverSpeedLimit = 100;        // Current speed limit due to steering angl
 bool throttleHoldingHigh = false;   // Is throttle currently held high?
 uint32_t lastRcInputTime = 0;       // Last time we got RC input (steer2 or throttle2)
 
-// Steering encoder validity. Starts false on every boot and only becomes true
-// after consecutive successful AS5600 angle reads.
+// Steering encoder safety state. A single failed read disables steering immediately.
+// Three consecutive failures latch the vehicle shutdown until reboot.
 bool encoderValid = false;
 uint8_t encoderGoodReadCount = 0;
+uint8_t encoderFailureCount = 0;
+bool encoderFaultLatched = false;
+uint8_t encoderFaultCode = 0;
 
 // Serial command buffer for ESP32 commands
 char cmdBuffer[64];
@@ -220,10 +225,9 @@ void setup() {
     Wire.setClock(400000);  // 400 kHz I2C speed
     Serial.println("I2C Initialized for AS5600 encoder (400 kHz)");
     
-    // Startup I2C bus scan temporarily disabled for isolation testing.
-    // This leaves the normal AS5600 angle read as the first I2C transaction after Wire.begin().
+    // Restore the normal startup bus scan. The AS5600 register probe remains disabled.
     delay(100);
-    // scanI2CBus();
+    scanI2CBus();
     delay(100);
     
     // Initialize telemetry (sends to ESP32 via Serial3)
@@ -660,8 +664,8 @@ void scanI2CBus() {
             delay(100);  // Slow down output so it's readable
             found++;
             
-            // If this is the AS5600 address, leave the diagnostic register probe
-            // disabled while we isolate whether it is disturbing normal angle reads.
+            // The old AS5600 register probe stays disabled. It is not required
+            // for normal operation and should remain separate from the safety path.
             if (addr == ENCODER_I2C_ADDR) {
                 delay(200);
                 // probeAS5600();
@@ -722,6 +726,45 @@ void probeAS5600() {
 }
 
 //******************************************************************************
+// Encoder fault helpers
+//******************************************************************************
+void latchEncoderFault(uint8_t code) {
+    if (encoderFaultLatched) {
+        return;
+    }
+
+    encoderFaultLatched = true;
+    encoderFaultCode = code;
+    encoderValid = false;
+    encoderGoodReadCount = 0;
+    currentDriveSpeed = 0;
+    currentDriveDirection = 0;
+
+    allMotorsOff();
+
+    Serial.printf("[FAULT] ENCODER %u LATCHED - all motor outputs disabled until reboot\n", code);
+    Serial3.printf("FAULT:ENCODER:%u\n", code);
+}
+
+void noteEncoderFailure(uint8_t code) {
+    // Never steer from a failed/stale read, even before the fault is confirmed.
+    encoderValid = false;
+    encoderGoodReadCount = 0;
+
+    if (encoderFaultLatched) {
+        return;
+    }
+
+    if (encoderFailureCount < 255) {
+        encoderFailureCount++;
+    }
+
+    if (encoderFailureCount >= ENCODER_FAULT_CONFIRM_FAILURES) {
+        latchEncoderFault(code);
+    }
+}
+
+//******************************************************************************
 // readAS5600Angle() - Read AS5600 angle via I2C
 //******************************************************************************
 void readAS5600Angle(TelemetryData& td) {
@@ -737,8 +780,7 @@ void readAS5600Angle(TelemetryData& td) {
     byte error = Wire.endTransmission();
     
     if (error != 0) {
-        encoderValid = false;
-        encoderGoodReadCount = 0;
+        noteEncoderFailure(error);
         if (!i2cErrorReported) {
             Serial.printf("I2C Error on transmission: %d (will not repeat)\n", error);
             i2cErrorReported = true;
@@ -757,6 +799,13 @@ void readAS5600Angle(TelemetryData& td) {
         td.encoderAngle = (angleDeg + ENCODER_ANGLE_OFFSET) % 360;
         lastValidAngle = td.encoderAngle;
         i2cErrorReported = false;  // Reset flag when communication works
+        encoderFailureCount = 0;
+
+        // A latched fault never self-clears. Reboot is required after repair.
+        if (encoderFaultLatched) {
+            encoderValid = false;
+            return;
+        }
 
         if (encoderGoodReadCount < ENCODER_VALID_READS_REQUIRED) {
             encoderGoodReadCount++;
@@ -765,10 +814,10 @@ void readAS5600Angle(TelemetryData& td) {
             encoderValid = true;
             Serial.printf("[STEER] AS5600 VALID after %u consecutive angle reads - steering enabled\n",
                           ENCODER_VALID_READS_REQUIRED);
+            Serial3.println("FAULT:NONE");
         }
     } else {
-        encoderValid = false;
-        encoderGoodReadCount = 0;
+        noteEncoderFailure(ENCODER_FAULT_NO_DATA);
         if (!i2cErrorReported) {
             Serial.printf("I2C Error: No data from AS5600 (available: %d bytes)\n", Wire.available());
             i2cErrorReported = true;
@@ -959,6 +1008,16 @@ void initPeripherals() {
 //******************************************************************************
 void updatePeripherals() {
     TelemetryData& td = Telem.data();
+
+    // Confirmed encoder faults are latched until reboot. For this revision there
+    // is intentionally no RC limp-home override yet, so every motor stays off.
+    if (encoderFaultLatched) {
+        currentDriveSpeed = 0;
+        currentDriveDirection = 0;
+        allMotorsOff();
+        td.controlSource = rcModeActive ? 2 : 1;
+        return;
+    }
     
     // RC MODE ACTIVATION DETECTION
     // Hold RC throttle (throttle2) full REVERSE for 3 seconds to arm RC mode
@@ -1382,6 +1441,12 @@ void printPeripheralStatus() {
     Serial.printf("  Steering:  %4d raw  %4d%%\n", td.steeringRaw, td.steeringPercent);
     Serial.printf("  Throttle:  %4d raw  %4d%%\n", td.throttleRaw, td.throttlePercent);
     Serial.printf("  Encoder:   %3d deg  (current)\n", td.encoderAngle);
+    Serial.printf("  Encoder valid: %s\n", encoderValid ? "YES" : "NO");
+    Serial.printf("  Encoder fault: %s", encoderFaultLatched ? "LATCHED" : "none");
+    if (encoderFaultLatched) {
+        Serial.printf(" (code %u)", encoderFaultCode);
+    }
+    Serial.println();
     Serial.printf("  Target:    %3d deg\n", targetAngle);
     Serial.printf("  Error:     %4d deg\n", angleError);
     Serial.printf("  Shifter:   %s\n", td.shifterFwd ? "FWD" : (td.shifterRev ? "REV" : "NEUTRAL"));
@@ -1435,6 +1500,9 @@ void heartbeat() {
     if (millis() - lastHeartbeat > HEARTBEAT_INTERVAL) {
         Serial.println("Teensy running...");
         Serial3.println("heartbeat");
+        if (encoderFaultLatched) {
+            Serial3.printf("FAULT:ENCODER:%u\n", encoderFaultCode);
+        }
         lastHeartbeat = millis();
     }
 }
