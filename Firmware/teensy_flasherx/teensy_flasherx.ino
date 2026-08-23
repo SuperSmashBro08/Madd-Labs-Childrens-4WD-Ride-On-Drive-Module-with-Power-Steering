@@ -18,7 +18,7 @@
 //******************************************************************************
 // Version Information
 //******************************************************************************
-#define FIRMWARE_VERSION "1.8.8"
+#define FIRMWARE_VERSION "1.8.9"
 #define BUILD_DATE       __DATE__ " " __TIME__
 
 //******************************************************************************
@@ -659,10 +659,11 @@ void scanI2CBus() {
             delay(100);  // Slow down output so it's readable
             found++;
             
-            // If this is the AS5600 address, probe it
+            // If this is the AS5600 address, leave the diagnostic register probe
+            // disabled while we isolate whether it is disturbing normal angle reads.
             if (addr == ENCODER_I2C_ADDR) {
                 delay(200);
-                probeAS5600();
+                // probeAS5600();
                 delay(200);
             }
         }
