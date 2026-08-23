@@ -29,7 +29,7 @@ const char* password = WIFI_PASSWORD;
 // ============================================
 // Version Information
 // ============================================
-#define ESP_FIRMWARE_VERSION "1.2.7"
+#define ESP_FIRMWARE_VERSION "1.2.8"
 #define ESP_BUILD_DATE __DATE__ " " __TIME__
 String teensyVersion = "Unknown";
 
@@ -91,7 +91,8 @@ enum LedState {
     LED_RED,           // Not connected
     LED_GREEN,         // Connected, no heartbeat
     LED_GREEN_PULSE,   // Connected with heartbeat
-    LED_BLUE_PULSE     // Updating
+    LED_BLUE_PULSE,    // Updating
+    LED_YELLOW_CODE    // Latched encoder fault: blink fault number, then pause
 };
 LedState currentLedState = LED_OFF;
 unsigned long lastHeartbeat = 0;
@@ -100,6 +101,14 @@ uint8_t ledBrightness = 0;
 bool ledBrightnessUp = true;
 #define HEARTBEAT_TIMEOUT 15000  // 15 seconds without heartbeat = no pulse
 #define LED_PULSE_SPEED 10       // ms between brightness changes
+
+// Encoder fault indication received from Teensy
+bool encoderFaultActive = false;
+uint8_t encoderFaultCode = 0;
+unsigned long encoderFaultBlinkStart = 0;
+#define FAULT_BLINK_ON_MS   250
+#define FAULT_BLINK_OFF_MS  250
+#define FAULT_BLINK_PAUSE_MS 2000
 
 // Serial buffer for monitoring
 #define SERIAL_BUFFER_SIZE 4096
@@ -421,13 +430,16 @@ void setLedColor(uint8_t r, uint8_t g, uint8_t b) {
 void updateLedState() {
     unsigned long now = millis();
     
-    // Determine current state based on system status
+    // Determine current state based on system status.
+    // Update and connection-loss indications retain priority over fault blinking.
     if (espUpdating || teensyUpdating) {
         currentLedState = LED_BLUE_PULSE;
     } else if (WiFi.status() != WL_CONNECTED) {
         currentLedState = LED_RED;
     } else if (!teensyConnected) {
         currentLedState = LED_RED;
+    } else if (encoderFaultActive) {
+        currentLedState = LED_YELLOW_CODE;
     } else if (now - lastHeartbeat < HEARTBEAT_TIMEOUT) {
         currentLedState = LED_GREEN_PULSE;
     } else {
@@ -486,6 +498,22 @@ void updateLedState() {
                 }
                 setLedColor(0, 0, ledBrightness);
                 break;
+
+            case LED_YELLOW_CODE: {
+                // Blink the encoder fault number, then stay dark for a long pause.
+                uint8_t blinkCount = encoderFaultCode > 0 ? encoderFaultCode : 1;
+                unsigned long blinkPeriod = FAULT_BLINK_ON_MS + FAULT_BLINK_OFF_MS;
+                unsigned long blinkWindow = (unsigned long)blinkCount * blinkPeriod;
+                unsigned long cycleLength = blinkWindow + FAULT_BLINK_PAUSE_MS;
+                unsigned long elapsed = (now - encoderFaultBlinkStart) % cycleLength;
+
+                if (elapsed < blinkWindow && (elapsed % blinkPeriod) < FAULT_BLINK_ON_MS) {
+                    setLedColor(255, 255, 0);
+                } else {
+                    setLedColor(0, 0, 0);
+                }
+                break;
+            }
         }
     }
 }
@@ -600,6 +628,23 @@ void loop() {
                 if (strstr(serialBuffer, "heartbeat") != NULL) {
                     lastHeartbeat = millis();
                 }
+
+                // Check for latched encoder fault status from Teensy.
+                char* encoderFaultMsg = strstr(serialBuffer, "FAULT:ENCODER:");
+                if (encoderFaultMsg != NULL) {
+                    int code = atoi(encoderFaultMsg + 14);
+                    if (code > 0 && code <= 20) {
+                        if (!encoderFaultActive || encoderFaultCode != code) {
+                            encoderFaultBlinkStart = millis();
+                        }
+                        encoderFaultCode = (uint8_t)code;
+                        encoderFaultActive = true;
+                    }
+                } else if (strstr(serialBuffer, "FAULT:NONE") != NULL) {
+                    encoderFaultActive = false;
+                    encoderFaultCode = 0;
+                    encoderFaultBlinkStart = millis();
+                }
                 
                 // Check for rollover status message and broadcast to web clients
                 if (strstr(serialBuffer, "ROLLOVER:ON") != NULL) {
@@ -649,6 +694,8 @@ void handleStatus() {
     doc["espVersion"] = ESP_FIRMWARE_VERSION;
     doc["espBuild"] = ESP_BUILD_DATE;
     doc["teensyVersion"] = teensyVersion;
+    doc["encoderFault"] = encoderFaultActive;
+    doc["encoderFaultCode"] = encoderFaultCode;
     
     String response;
     serializeJson(doc, response);
