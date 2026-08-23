@@ -29,7 +29,7 @@ const char* password = WIFI_PASSWORD;
 // ============================================
 // Version Information
 // ============================================
-#define ESP_FIRMWARE_VERSION "1.2.6"
+#define ESP_FIRMWARE_VERSION "1.2.7"
 #define ESP_BUILD_DATE __DATE__ " " __TIME__
 String teensyVersion = "Unknown";
 
@@ -175,8 +175,10 @@ const char index_html[] PROGMEM = R"rawliteral(
             <h2>System Status</h2>
             <p><span class="indicator" id="espIndicator"></span>ESP32: <span id="espStatus">Checking...</span> <span id="espVersion" style="color:#888; font-size:0.9em;"></span></p>
             <p><span class="indicator" id="teensyIndicator"></span>Teensy 4.1: <span id="teensyStatus">Checking...</span> <span id="teensyVersion" style="color:#888; font-size:0.9em;"></span></p>
+            <p><span class="indicator" id="rolloverIndicator"></span>Rollover Protection: <span id="rolloverStatus">Unknown</span></p>
             <button class="btn" onclick="checkStatus()">Refresh Status</button>
             <button class="btn btn-danger" onclick="resetTeensy()">Reset Teensy</button>
+            <button class="btn" id="rolloverBtn" onclick="toggleRollover()" style="background:#ff9800;">Toggle Rollover</button>
         </div>
 
         <div class="flex-row">
@@ -224,7 +226,11 @@ const char index_html[] PROGMEM = R"rawliteral(
         let autoScroll = true;
         
         function initWebSocket() {
-            ws = new WebSocket('ws://' + window.location.hostname + ':81');
+            const wsUrl = window.location.protocol === 'https:'
+                ? 'wss://maddmotionws.maddmanufacturing.com/'
+                : 'ws://' + window.location.hostname + ':81';
+
+            ws = new WebSocket(wsUrl);
             ws.onopen = () => logSerial('ESP', 'WebSocket connected');
             ws.onclose = () => { logSerial('ERROR', 'WebSocket disconnected'); setTimeout(initWebSocket, 2000); };
             ws.onmessage = (e) => {
@@ -233,6 +239,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                     if (data.type === 'serial') logSerial(data.source, data.message);
                     else if (data.type === 'progress') updateProgress(data);
                     else if (data.type === 'status') updateStatus(data);
+                    else if (data.type === 'rollover') updateRolloverStatus(data.enabled);
                     else if (data.type === 'ota_complete' && data.success) {
                         document.getElementById('espStatus2').innerHTML = '<div class="status success">OTA Update complete! Rebooting...</div>';
                         document.getElementById('espProgressBar').style.width = '100%';
@@ -290,6 +297,19 @@ const char index_html[] PROGMEM = R"rawliteral(
         async function resetTeensy() {
             logSerial('ESP', 'Resetting Teensy...');
             await fetch('/teensy/reset', { method: 'POST' });
+        }
+        
+        function toggleRollover() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({cmd: 'ROLLOVER_TOGGLE'}));
+                logSerial('ESP', 'Toggling rollover protection...');
+            }
+        }
+        
+        function updateRolloverStatus(enabled) {
+            document.getElementById('rolloverStatus').textContent = enabled ? 'ENABLED' : 'DISABLED';
+            document.getElementById('rolloverIndicator').className = 'indicator ' + (enabled ? 'connected' : 'disconnected');
+            document.getElementById('rolloverBtn').style.background = enabled ? '#00ff88' : '#ff9800';
         }
         
         function updateProgress(data) {
@@ -579,6 +599,23 @@ void loop() {
                 // Check for heartbeat message
                 if (strstr(serialBuffer, "heartbeat") != NULL) {
                     lastHeartbeat = millis();
+                }
+                
+                // Check for rollover status message and broadcast to web clients
+                if (strstr(serialBuffer, "ROLLOVER:ON") != NULL) {
+                    StaticJsonDocument<64> doc;
+                    doc["type"] = "rollover";
+                    doc["enabled"] = true;
+                    String msg;
+                    serializeJson(doc, msg);
+                    webSocket.broadcastTXT(msg);
+                } else if (strstr(serialBuffer, "ROLLOVER:OFF") != NULL) {
+                    StaticJsonDocument<64> doc;
+                    doc["type"] = "rollover";
+                    doc["enabled"] = false;
+                    String msg;
+                    serializeJson(doc, msg);
+                    webSocket.broadcastTXT(msg);
                 }
                 
                 broadcastSerial(serialBuffer);
@@ -925,12 +962,33 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
     switch (type) {
         case WStype_CONNECTED:
             Serial.printf("WebSocket client %u connected\n", num);
+            // Request current rollover status from Teensy
+            TEENSY_DEBUG_SERIAL.println("ROLLOVER_STATUS");
             break;
         case WStype_DISCONNECTED:
             Serial.printf("WebSocket client %u disconnected\n", num);
             break;
         case WStype_TEXT:
             // Handle incoming commands from web interface
+            {
+                StaticJsonDocument<128> doc;
+                DeserializationError err = deserializeJson(doc, payload, length);
+                if (!err) {
+                    const char* cmd = doc["cmd"];
+                    if (cmd) {
+                        if (strcmp(cmd, "ROLLOVER_TOGGLE") == 0) {
+                            TEENSY_DEBUG_SERIAL.println("ROLLOVER_TOGGLE");
+                            logMessage("Sent: ROLLOVER_TOGGLE");
+                        } else if (strcmp(cmd, "ROLLOVER_ON") == 0) {
+                            TEENSY_DEBUG_SERIAL.println("ROLLOVER_ON");
+                        } else if (strcmp(cmd, "ROLLOVER_OFF") == 0) {
+                            TEENSY_DEBUG_SERIAL.println("ROLLOVER_OFF");
+                        } else if (strcmp(cmd, "ROLLOVER_STATUS") == 0) {
+                            TEENSY_DEBUG_SERIAL.println("ROLLOVER_STATUS");
+                        }
+                    }
+                }
+            }
             break;
     }
 }

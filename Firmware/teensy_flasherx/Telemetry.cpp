@@ -86,9 +86,9 @@ void Telemetry::printHeader() {
         // Fixed-width header matching data columns
         // Each column has specific width for alignment
         _telemSerial->println();
-        _telemSerial->println("|------- RAW INPUTS ------|--- PROCESSED (%) ---|-- DRIVE % --|------ CURRENT (A) ------|SOURCE|-- SYS --||");
-        _telemSerial->println("| Steer Throt Str2  Thr2  Encdr | Steer Throt Str2  Thr2  | FrL  FrR  ReL  ReR| FrL   FrR   ReL   ReR  |      | Loop  T ||");
-        _telemSerial->println("|---------------------------|--------------------------|-------------------|-------------------------|------|---------||");
+        _telemSerial->println("|------- RAW INPUTS ------|--- PROCESSED (%) ---|-- DRIVE % --|---------- CURRENT (A) ----------|SOURCE|-- SYS --||");
+        _telemSerial->println("| Steer Throt Str2  Thr2  Encdr | Steer Throt Str2  Thr2  | FrL  FrR  ReL  ReR| StL   StR   FrL   FrR   ReL   ReR|      | Loop  T ||");
+        _telemSerial->println("|---------------------------|--------------------------|-------------------|----------------------------------|------|---------|");
     }
 }
 
@@ -135,6 +135,10 @@ void Telemetry::sendCompact() {
     
     // Current in Amps (divide raw ADC by scale factor, display with 1 decimal)
     // Raw ADC 0-1023 maps to current - showing as X.X A format
+    _telemSerial->print(_data.steerCurrentL / 100.0, 1);
+    _telemSerial->print("A ");
+    _telemSerial->print(_data.steerCurrentR / 100.0, 1);
+    _telemSerial->print("A ");
     _telemSerial->print(_data.frontCurrentL / 100.0, 1);
     _telemSerial->print("A ");
     _telemSerial->print(_data.frontCurrentR / 100.0, 1);

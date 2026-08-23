@@ -18,7 +18,7 @@
 //******************************************************************************
 // Version Information
 //******************************************************************************
-#define FIRMWARE_VERSION "1.5.8"
+#define FIRMWARE_VERSION "1.8.7"
 #define BUILD_DATE       __DATE__ " " __TIME__
 
 //******************************************************************************
@@ -39,12 +39,12 @@
 #define STEERING_FILTER_ALPHA 0.3     // Low-pass filter: 0.0-1.0 (lower = more filtering)
 
 // ----- STEERING MOTOR LIMITS (Encoder Angle in Degrees) -----
-// After applying ENCODER_ANGLE_OFFSET, center should display 180°
-// This keeps steering range (135°-225°) away from the 0°/360° wraparound
-#define STEER_ANGLE_CENTER    180     // Always 180 when offset is calibrated correctly
+// Center is 0° (raw encoder reading at straight wheels)
+// Range wraps around 360°/0° boundary: full left ~315°, full right ~45°
+#define STEER_ANGLE_CENTER    0       // Encoder angle when wheels point straight
 #define STEER_ANGLE_RANGE     45      // ± degrees from center (adjust for your steering linkage)
-#define STEER_ANGLE_MIN       (STEER_ANGLE_CENTER - STEER_ANGLE_RANGE)  // Calculated: full left (135°)
-#define STEER_ANGLE_MAX       (STEER_ANGLE_CENTER + STEER_ANGLE_RANGE)  // Calculated: full right (225°)
+#define STEER_ANGLE_MIN       (360 - STEER_ANGLE_RANGE)  // Full left (315°)
+#define STEER_ANGLE_MAX       STEER_ANGLE_RANGE           // Full right (45°)
 #define STEER_MOTOR_SPEED     100     // PWM speed for steering (0-255)
 #define STEER_ANGLE_DEADBAND  15      // Stop motor when within ± this many degrees of target
 
@@ -68,7 +68,7 @@
 // 6. Set ENCODER_ANGLE_OFFSET to your calculated value
 // 7. After upload, center should now display 180°
 //
-#define ENCODER_ANGLE_OFFSET  307     // Offset to make center read 180° (raw 233° + 307 = 540 % 360 = 180°)
+#define ENCODER_ANGLE_OFFSET  300     // Adjusted for physical steering arm mounting (+10°)
 
 // ----- CURRENT SENSING -----
 // All current sense pins output 0-3.3V proportional to motor current
@@ -147,17 +147,17 @@
 #define HEARTBEAT_INTERVAL 10000  // ms
 #define LOOP_TIME_SMOOTHING 0.1   // EMA smoothing factor for loop time
 
-// Soft stop configuration for drive motors
-#define SOFT_STOP_RATE       5      // Percentage to decrease per update cycle
-#define SOFT_STOP_INTERVAL   50     // Milliseconds between ramp-down steps
+// Soft start/stop configuration for drive motors
+#define SOFT_START_RATE      2      // Percentage to increase per update cycle (lower = slower acceleration)
+#define SOFT_START_INTERVAL  30     // Milliseconds between ramp-up steps
+#define SOFT_STOP_RATE       1      // Percentage to decrease per update cycle (lower = slower deceleration)
+#define SOFT_STOP_INTERVAL   30     // Milliseconds between ramp-down steps
 
-// Rollover protection - limits steering at high speed and slows down for sharp turns
-#define ROLLOVER_PROTECTION_ENABLED  true   // Master enable for rollover protection
-#define ROLLOVER_SPEED_THRESHOLD     50     // Above this speed %, start limiting steering
-#define ROLLOVER_SPEED_FULL_LIMIT    80     // At this speed %, max steering limit applies
-#define ROLLOVER_MIN_STEER_RANGE     15     // Minimum steering range % at high speed (15 = ±15°)
-#define ROLLOVER_SLOWDOWN_ANGLE      30     // Steer angle % where speed reduction begins
-#define ROLLOVER_SLOWDOWN_FACTOR     50     // Max speed % when at full steering angle
+// Rollover protection - limits throttle based on actual steering angle
+// The sharper the turn (based on encoder), the more throttle is limited
+#define ROLLOVER_STEER_THRESHOLD     20     // Steering angle % where throttle limiting begins (0-100)
+#define ROLLOVER_MAX_THROTTLE_AT_FULL_STEER  40  // Max throttle % allowed at full steering (100%)
+#define ROLLOVER_DEFAULT_ENABLED     false  // Default state on boot (can be toggled at runtime)
 
 //******************************************************************************
 // Global Variables
@@ -176,10 +176,15 @@ int currentDriveDirection = 0;       // Current direction (0=OFF, 1=FWD, 2=REV)
 uint32_t lastSoftStopTime = 0;       // Last time we did a ramp-down step
 
 // Rollover protection state
+bool rolloverProtectionEnabled = ROLLOVER_DEFAULT_ENABLED;  // Runtime enable/disable
 int limitedSteeringPercent = 0;      // Steering % after speed-based limiting
 int rolloverSpeedLimit = 100;        // Current speed limit due to steering angle
 bool throttleHoldingHigh = false;   // Is throttle currently held high?
 uint32_t lastRcInputTime = 0;       // Last time we got RC input (steer2 or throttle2)
+
+// Serial command buffer for ESP32 commands
+char cmdBuffer[64];
+int cmdBufferIndex = 0;
 
 //******************************************************************************
 // setup()
@@ -378,68 +383,68 @@ void driveRearMotor(int direction, int throttlePercent) {
 }
 
 //******************************************************************************
-// applySoftStop() - Gradually ramp motor speed to target with soft stop
+// applySoftStop() - Gradually ramp motor speed to target with soft start/stop
 // Prevents jarring stops when throttle is released on geared motors
 // targetDirection: 0=OFF, 1=FORWARD, 2=REVERSE
 // targetSpeed: 0-100 (target percentage)
 //******************************************************************************
 void applySoftStop(int targetDirection, int targetSpeed) {
+    // If rollover protection is OFF, bypass soft start/stop - immediate response
+    if (!rolloverProtectionEnabled) {
+        currentDriveDirection = targetDirection;
+        currentDriveSpeed = targetSpeed;
+        if (targetSpeed == 0 || targetDirection == 0) {
+            driveFrontMotor(0, 0);
+            driveRearMotor(0, 0);
+        } else {
+            driveFrontMotor(targetDirection, targetSpeed);
+            driveRearMotor(targetDirection, targetSpeed);
+        }
+        return;
+    }
+    
     uint32_t now = millis();
+    bool timeToUpdate = (now - lastSoftStopTime >= SOFT_START_INTERVAL);
     
     // If direction changed (including to/from neutral), we need special handling
     if (targetDirection != currentDriveDirection) {
-        if (targetDirection == 0 || currentDriveDirection == 0) {
-            // Going to/from neutral - ramp down current speed first
-            if (currentDriveSpeed > 0) {
-                // Ramp down at soft stop rate
-                if (now - lastSoftStopTime >= SOFT_STOP_INTERVAL) {
-                    currentDriveSpeed -= SOFT_STOP_RATE;
-                    if (currentDriveSpeed < 0) currentDriveSpeed = 0;
-                    lastSoftStopTime = now;
-                }
-                // Drive at current ramping-down speed
-                driveFrontMotor(currentDriveDirection, currentDriveSpeed);
-                driveRearMotor(currentDriveDirection, currentDriveSpeed);
-                return;
-            } else {
-                // Speed is 0, can change direction now
-                currentDriveDirection = targetDirection;
+        // Must ramp down to 0 first before changing direction
+        if (currentDriveSpeed > 0) {
+            if (timeToUpdate) {
+                currentDriveSpeed -= SOFT_STOP_RATE;
+                if (currentDriveSpeed < 0) currentDriveSpeed = 0;
+                lastSoftStopTime = now;
             }
+            // Drive at current ramping-down speed (keep old direction)
+            driveFrontMotor(currentDriveDirection, currentDriveSpeed);
+            driveRearMotor(currentDriveDirection, currentDriveSpeed);
+            return;
         } else {
-            // Changing from FWD to REV or vice versa - must stop first
-            if (currentDriveSpeed > 0) {
-                // Ramp down first
-                if (now - lastSoftStopTime >= SOFT_STOP_INTERVAL) {
-                    currentDriveSpeed -= SOFT_STOP_RATE;
-                    if (currentDriveSpeed < 0) currentDriveSpeed = 0;
-                    lastSoftStopTime = now;
-                }
-                driveFrontMotor(currentDriveDirection, currentDriveSpeed);
-                driveRearMotor(currentDriveDirection, currentDriveSpeed);
-                return;
-            } else {
-                // Stopped, can change direction
-                currentDriveDirection = targetDirection;
-            }
+            // Speed is 0, can change direction now
+            currentDriveDirection = targetDirection;
+            // Fall through to ramp up in new direction
         }
     }
     
-    // Same direction - adjust speed towards target
+    // Same direction (or just changed) - adjust speed towards target
     if (currentDriveSpeed < targetSpeed) {
-        // Accelerating - can be immediate (no soft start needed)
-        currentDriveSpeed = targetSpeed;
-        lastSoftStopTime = now;
+        // Accelerating - use soft start
+        if (timeToUpdate) {
+            currentDriveSpeed += SOFT_START_RATE;
+            if (currentDriveSpeed > targetSpeed) currentDriveSpeed = targetSpeed;
+            lastSoftStopTime = now;
+        }
     } else if (currentDriveSpeed > targetSpeed) {
         // Decelerating - use soft stop
-        if (now - lastSoftStopTime >= SOFT_STOP_INTERVAL) {
+        if (timeToUpdate) {
             currentDriveSpeed -= SOFT_STOP_RATE;
             if (currentDriveSpeed < targetSpeed) currentDriveSpeed = targetSpeed;
             lastSoftStopTime = now;
         }
     }
     
-    // Drive motors at current speed
-    if (currentDriveSpeed == 0) {
+    // Always drive motors at current speed (every loop iteration)
+    if (currentDriveSpeed == 0 || currentDriveDirection == 0) {
         driveFrontMotor(0, 0);
         driveRearMotor(0, 0);
     } else {
@@ -449,58 +454,100 @@ void applySoftStop(int targetDirection, int targetSpeed) {
 }
 
 //******************************************************************************
-// calculateRolloverProtection() - Limit steering at high speed, slow for sharp turns
-// Returns: adjusted steering percentage based on current speed
-// Also sets rolloverSpeedLimit for speed reduction during sharp turns
+// calculateRolloverProtection() - Calculate max allowed throttle based on steering angle
+// Uses ACTUAL encoder angle (not steering input) to determine throttle limit
+// Returns: max allowed throttle percentage (0-100)
 //******************************************************************************
-int calculateRolloverProtection(int steeringInput, int currentSpeed) {
-    if (!ROLLOVER_PROTECTION_ENABLED) {
-        rolloverSpeedLimit = 100;
-        return steeringInput;
+int calculateRolloverProtection(int actualEncoderAngle) {
+    if (!rolloverProtectionEnabled) {
+        return 100;  // No limit
     }
     
-    int limitedSteering = steeringInput;
+    // Calculate how far we are from center (180° at straight wheels)
+    // Center is 180°, left is 135° (180-45), right is 225° (180+45)
+    const int CENTER_ANGLE = 180;
+    int angleFromCenter = actualEncoderAngle - CENTER_ANGLE;
     
-    // PART 1: Limit steering angle at high speeds
-    // At speeds above threshold, reduce max steering angle proportionally
-    if (currentSpeed > ROLLOVER_SPEED_THRESHOLD) {
-        // Calculate how much to limit steering (0-100%)
-        // At ROLLOVER_SPEED_THRESHOLD: no limit (100% steering allowed)
-        // At ROLLOVER_SPEED_FULL_LIMIT: max limit (ROLLOVER_MIN_STEER_RANGE % allowed)
-        int speedRange = ROLLOVER_SPEED_FULL_LIMIT - ROLLOVER_SPEED_THRESHOLD;
-        int speedAboveThreshold = currentSpeed - ROLLOVER_SPEED_THRESHOLD;
+    // Normalize to -180 to +180 range for proper distance calculation
+    if (angleFromCenter > 180) {
+        angleFromCenter = angleFromCenter - 360;
+    } else if (angleFromCenter < -180) {
+        angleFromCenter = angleFromCenter + 360;
+    }
+    angleFromCenter = abs(angleFromCenter);  // Now it's 0-180
+    
+    // Convert to percentage of max steering range
+    int steerPercent = (angleFromCenter * 100) / STEER_ANGLE_RANGE;
+    steerPercent = constrain(steerPercent, 0, 100);
+    
+    // Debug output (every second via static timer)
+    static unsigned long lastRolloverDebug = 0;
+    if (millis() - lastRolloverDebug >= 1000) {
+        lastRolloverDebug = millis();
+        Serial.printf("ROLLOVER: enc=%d° center=%d° fromCenter=%d° steer%%=%d%% threshold=%d%%\n",
+                     actualEncoderAngle, CENTER_ANGLE, angleFromCenter, steerPercent, ROLLOVER_STEER_THRESHOLD);
+    }
+    
+    // If steering is below threshold, allow full throttle
+    if (steerPercent <= ROLLOVER_STEER_THRESHOLD) {
+        return 100;
+    }
+    
+    // Linear interpolation from 100% throttle at threshold to MIN at full steering
+    int steerRange = 100 - ROLLOVER_STEER_THRESHOLD;
+    int steerAboveThreshold = steerPercent - ROLLOVER_STEER_THRESHOLD;
+    
+    int maxThrottle = 100 - ((100 - ROLLOVER_MAX_THROTTLE_AT_FULL_STEER) * steerAboveThreshold / steerRange);
+    maxThrottle = constrain(maxThrottle, ROLLOVER_MAX_THROTTLE_AT_FULL_STEER, 100);
+    
+    return maxThrottle;
+}
+
+//******************************************************************************
+// Rollover protection enable/disable functions (for external control)
+//******************************************************************************
+void setRolloverProtection(bool enabled) {
+    rolloverProtectionEnabled = enabled;
+    Serial.printf("Rollover protection: %s\n", enabled ? "ENABLED" : "DISABLED");
+    Serial3.printf("ROLLOVER:%s\n", enabled ? "ON" : "OFF");
+}
+
+bool isRolloverProtectionEnabled() {
+    return rolloverProtectionEnabled;
+}
+
+void toggleRolloverProtection() {
+    setRolloverProtection(!rolloverProtectionEnabled);
+}
+
+//******************************************************************************
+// processEsp32Commands() - Handle commands from ESP32 via Serial3
+//******************************************************************************
+void processEsp32Commands() {
+    while (Serial3.available()) {
+        char c = Serial3.read();
         
-        // Calculate allowed steering range (100% down to MIN_STEER_RANGE)
-        int allowedRange;
-        if (speedAboveThreshold >= speedRange) {
-            allowedRange = ROLLOVER_MIN_STEER_RANGE;
-        } else {
-            // Linear interpolation between 100% and MIN_STEER_RANGE
-            allowedRange = 100 - ((100 - ROLLOVER_MIN_STEER_RANGE) * speedAboveThreshold / speedRange);
+        if (c == '\n' || c == '\r') {
+            if (cmdBufferIndex > 0) {
+                cmdBuffer[cmdBufferIndex] = '\0';
+                
+                // Process the command
+                if (strcmp(cmdBuffer, "ROLLOVER_ON") == 0) {
+                    setRolloverProtection(true);
+                } else if (strcmp(cmdBuffer, "ROLLOVER_OFF") == 0) {
+                    setRolloverProtection(false);
+                } else if (strcmp(cmdBuffer, "ROLLOVER_TOGGLE") == 0) {
+                    toggleRolloverProtection();
+                } else if (strcmp(cmdBuffer, "ROLLOVER_STATUS") == 0) {
+                    Serial3.printf("ROLLOVER:%s\n", rolloverProtectionEnabled ? "ON" : "OFF");
+                }
+                
+                cmdBufferIndex = 0;
+            }
+        } else if (cmdBufferIndex < sizeof(cmdBuffer) - 1) {
+            cmdBuffer[cmdBufferIndex++] = c;
         }
-        
-        // Limit steering to allowed range
-        limitedSteering = constrain(steeringInput, -allowedRange, allowedRange);
     }
-    
-    // PART 2: Reduce speed when steering angle is high
-    // This slows down the car before allowing a sharp turn
-    int absSteer = abs(limitedSteering);
-    if (absSteer > ROLLOVER_SLOWDOWN_ANGLE) {
-        // Calculate speed limit based on steering angle
-        // At ROLLOVER_SLOWDOWN_ANGLE: 100% speed allowed
-        // At 100% steering: ROLLOVER_SLOWDOWN_FACTOR % speed max
-        int steerRange = 100 - ROLLOVER_SLOWDOWN_ANGLE;
-        int steerAboveThreshold = absSteer - ROLLOVER_SLOWDOWN_ANGLE;
-        
-        // Linear reduction from 100% to SLOWDOWN_FACTOR
-        rolloverSpeedLimit = 100 - ((100 - ROLLOVER_SLOWDOWN_FACTOR) * steerAboveThreshold / steerRange);
-        rolloverSpeedLimit = constrain(rolloverSpeedLimit, ROLLOVER_SLOWDOWN_FACTOR, 100);
-    } else {
-        rolloverSpeedLimit = 100;  // No speed limit for small steering angles
-    }
-    
-    return limitedSteering;
 }
 
 //******************************************************************************
@@ -545,6 +592,9 @@ void loop() {
     
     // Handle USB serial commands
     handleSerialCommands();
+    
+    // Handle ESP32 debug serial commands (Serial3)
+    processEsp32Commands();
     
     // Read all inputs and update telemetry data
     readInputs();
@@ -672,7 +722,7 @@ void readAS5600Angle(TelemetryData& td) {
     // 4096 counts = 360 degrees, so angle_degrees = (counts / 4096) * 360
     
     static bool i2cErrorReported = false;
-    static uint16_t lastValidAngle = 180;  // Remember last good reading (default to center)
+    static uint16_t lastValidAngle = 0;  // Remember last good reading (default to center)
     
     Wire.beginTransmission(ENCODER_I2C_ADDR);
     Wire.write(0x0E);  // Angle register MSB
@@ -962,27 +1012,25 @@ void updatePeripherals() {
 void updateThrottle1Controls(TelemetryData& td) {
     // THROTTLE1 MODE: Control front and rear motors with throttle
     // Shifter controls direction: FWD=Forward, REV=Reverse, NEUTRAL=Off
-    // Rollover protection limits steering at high speed and slows for sharp turns
+    // Rollover protection limits throttle based on actual steering angle
     
-    // Apply rollover protection - limits steering based on speed, sets rolloverSpeedLimit
-    limitedSteeringPercent = calculateRolloverProtection(td.steeringPercent, td.throttlePercent);
+    // Calculate max allowed throttle based on ACTUAL encoder angle (not input)
+    int maxThrottle = calculateRolloverProtection(td.encoderAngle);
     
-    // Calculate speed with rollover limit applied
-    int actualSpeed = (td.throttlePercent * rolloverSpeedLimit) / 100;
+    // Limit requested throttle to max allowed
+    int actualSpeed = min(td.throttlePercent, maxThrottle);
     
     // DRIVE MOTORS: Shifter for direction, throttle for speed
+    // Use applySoftStop for gradual acceleration/deceleration
     if (td.shifterFwd) {
         // Forward
-        driveFrontMotor(1, actualSpeed);
-        driveRearMotor(1, actualSpeed);
+        applySoftStop(1, actualSpeed);
     } else if (td.shifterRev) {
         // Reverse
-        driveFrontMotor(2, actualSpeed);
-        driveRearMotor(2, actualSpeed);
+        applySoftStop(2, actualSpeed);
     } else {
         // Neutral - stop motors
-        driveFrontMotor(0, 0);
-        driveRearMotor(0, 0);
+        applySoftStop(0, 0);
     }
     
     // STEERING: Use steering input to position motor (only when shifter engaged)
@@ -996,27 +1044,25 @@ void updateRCControls(TelemetryData& td) {
     // RC MODE: Full remote control - ignores shifter completely
     // throttle2: -100 (reverse) to 0 (stop) to +100 (forward)
     // steer2: -100 (left) to 0 (center) to +100 (right)
-    // Rollover protection limits steering at high speed and slows for sharp turns
+    // Rollover protection limits throttle based on actual steering angle
     
-    // Apply rollover protection - limits steering based on speed, sets rolloverSpeedLimit
-    limitedSteeringPercent = calculateRolloverProtection(td.steer2Percent, abs(td.throttle2Percent));
+    // Calculate max allowed throttle based on ACTUAL encoder angle (not input)
+    int maxThrottle = calculateRolloverProtection(td.encoderAngle);
     
-    // Calculate speed with rollover limit applied
-    int actualSpeed = (abs(td.throttle2Percent) * rolloverSpeedLimit) / 100;
+    // Limit requested throttle to max allowed
+    int actualSpeed = min(abs(td.throttle2Percent), maxThrottle);
     
     // DRIVE MOTORS: throttle2 controls both direction AND speed
+    // Use applySoftStop for gradual acceleration/deceleration
     if (abs(td.throttle2Percent) < 5) {
         // Throttle near neutral - stop motors
-        driveFrontMotor(0, 0);
-        driveRearMotor(0, 0);
+        applySoftStop(0, 0);
     } else if (td.throttle2Percent > 0) {
         // Forward
-        driveFrontMotor(1, actualSpeed);
-        driveRearMotor(1, actualSpeed);
+        applySoftStop(1, actualSpeed);
     } else {
         // Reverse
-        driveFrontMotor(2, actualSpeed);
-        driveRearMotor(2, actualSpeed);
+        applySoftStop(2, actualSpeed);
     }
     
     // STEERING: Use steer2 for angle control (always enabled in RC mode)
@@ -1031,9 +1077,21 @@ void updateRCSteeringControls(TelemetryData& td) {
     // steer2: -100 (left) to 0 (center) to +100 (right)
     
     // Convert steer2 percentage to target angle
-    // Maps -100% to STEER_ANGLE_MIN, 0% to STEER_ANGLE_CENTER, +100% to STEER_ANGLE_MAX
-    int targetAngle = STEER_ANGLE_CENTER + (td.steer2Percent * STEER_ANGLE_RANGE) / 100;
-    targetAngle = constrain(targetAngle, STEER_ANGLE_MIN, STEER_ANGLE_MAX);
+    // Center=0°, Right=+45°, Left=-45° (which wraps to 315°)
+    int targetAngle = (td.steer2Percent * STEER_ANGLE_RANGE) / 100;
+    // Handle negative angles (wrap to 0-359 range)
+    if (targetAngle < 0) {
+        targetAngle += 360;
+    }
+    // Clamp to valid range: 0-45 or 315-359
+    if (targetAngle > STEER_ANGLE_MAX && targetAngle < STEER_ANGLE_MIN) {
+        // Outside valid range - clamp to nearest limit
+        if (targetAngle < 180) {
+            targetAngle = STEER_ANGLE_MAX;  // 45°
+        } else {
+            targetAngle = STEER_ANGLE_MIN;  // 315°
+        }
+    }
     
     // Get current encoder angle
     int currentAngle = td.encoderAngle;
@@ -1063,12 +1121,18 @@ void updateRCSteeringControls(TelemetryData& td) {
         td.steerPwmR = 0;
     } else if (angleError > 0) {
         // Target is clockwise - turn RIGHT
+        // Proportional speed: faster when far, slower when close
+        int speed = map(abs(angleError), STEER_ANGLE_DEADBAND, 45, 30, 100);
+        speed = constrain(speed, 30, 100);  // Min 30%, max 100%
         wasMovingRC = true;
-        driveSteeringMotor(2, 100);  // direction=2 (RIGHT), speed=100%
+        driveSteeringMotor(2, speed);  // direction=2 (RIGHT)
     } else {
         // Target is counter-clockwise - turn LEFT
+        // Proportional speed: faster when far, slower when close
+        int speed = map(abs(angleError), STEER_ANGLE_DEADBAND, 45, 30, 100);
+        speed = constrain(speed, 30, 100);  // Min 30%, max 100%
         wasMovingRC = true;
-        driveSteeringMotor(1, 100);  // direction=1 (LEFT), speed=100%
+        driveSteeringMotor(1, speed);  // direction=1 (LEFT)
     }
 }
 
@@ -1093,9 +1157,21 @@ void updateSteeringControls(TelemetryData& td) {
     // Encoder feedback drives motor to reach target position
     
     // Convert steering percentage to target angle
-    // Maps -100% to STEER_ANGLE_MIN, 0% to STEER_ANGLE_CENTER, +100% to STEER_ANGLE_MAX
-    int targetAngle = STEER_ANGLE_CENTER + (td.steeringPercent * STEER_ANGLE_RANGE) / 100;
-    targetAngle = constrain(targetAngle, STEER_ANGLE_MIN, STEER_ANGLE_MAX);
+    // Center=0°, Right=+45°, Left=-45° (which wraps to 315°)
+    int targetAngle = (td.steeringPercent * STEER_ANGLE_RANGE) / 100;
+    // Handle negative angles (wrap to 0-359 range)
+    if (targetAngle < 0) {
+        targetAngle += 360;
+    }
+    // Clamp to valid range: 0-45 or 315-359
+    if (targetAngle > STEER_ANGLE_MAX && targetAngle < STEER_ANGLE_MIN) {
+        // Outside valid range - clamp to nearest limit
+        if (targetAngle < 180) {
+            targetAngle = STEER_ANGLE_MAX;  // 45°
+        } else {
+            targetAngle = STEER_ANGLE_MIN;  // 315°
+        }
+    }
     
     // Get current encoder angle
     int currentAngle = td.encoderAngle;
@@ -1127,18 +1203,24 @@ void updateSteeringControls(TelemetryData& td) {
         td.steerPwmR = 0;
     } else if (angleError > 0) {
         // Target is clockwise - turn RIGHT
+        // Proportional speed: faster when far, slower when close
+        int speed = map(abs(angleError), STEER_ANGLE_DEADBAND, 45, 30, 100);
+        speed = constrain(speed, 30, 100);  // Min 30%, max 100%
         if (!wasMoving) {
             Serial.println(">>> STEER MOTOR ON - Turning RIGHT");
             wasMoving = true;
         }
-        driveSteeringMotor(2, 100);  // direction=2 (RIGHT), speed=100%
+        driveSteeringMotor(2, speed);  // direction=2 (RIGHT)
     } else {
         // Target is counter-clockwise - turn LEFT
+        // Proportional speed: faster when far, slower when close
+        int speed = map(abs(angleError), STEER_ANGLE_DEADBAND, 45, 30, 100);
+        speed = constrain(speed, 30, 100);  // Min 30%, max 100%
         if (!wasMoving) {
             Serial.println(">>> STEER MOTOR ON - Turning LEFT");
             wasMoving = true;
         }
-        driveSteeringMotor(1, 100);  // direction=1 (LEFT), speed=100%
+        driveSteeringMotor(1, speed);  // direction=1 (LEFT)
     }
 }
 
