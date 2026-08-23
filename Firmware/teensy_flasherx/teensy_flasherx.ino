@@ -18,7 +18,7 @@
 //******************************************************************************
 // Version Information
 //******************************************************************************
-#define FIRMWARE_VERSION "1.8.9"
+#define FIRMWARE_VERSION "1.8.10"
 #define BUILD_DATE       __DATE__ " " __TIME__
 
 //******************************************************************************
@@ -220,9 +220,10 @@ void setup() {
     Wire.setClock(400000);  // 400 kHz I2C speed
     Serial.println("I2C Initialized for AS5600 encoder (400 kHz)");
     
-    // Scan I2C bus for devices
+    // Startup I2C bus scan temporarily disabled for isolation testing.
+    // This leaves the normal AS5600 angle read as the first I2C transaction after Wire.begin().
     delay(100);
-    scanI2CBus();
+    // scanI2CBus();
     delay(100);
     
     // Initialize telemetry (sends to ESP32 via Serial3)
