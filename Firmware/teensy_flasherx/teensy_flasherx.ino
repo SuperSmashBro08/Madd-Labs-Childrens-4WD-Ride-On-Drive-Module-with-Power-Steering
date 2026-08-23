@@ -18,7 +18,7 @@
 //******************************************************************************
 // Version Information
 //******************************************************************************
-#define FIRMWARE_VERSION "1.8.7"
+#define FIRMWARE_VERSION "1.8.8"
 #define BUILD_DATE       __DATE__ " " __TIME__
 
 //******************************************************************************
@@ -57,6 +57,7 @@
 // ----- AS5600 MAGNETIC ENCODER (I2C ONLY) -----
 #define ENCODER_I2C_ADDR      0x36    // Default AS5600 I2C address
 #define ENCODER_CPR           4096    // Counts per revolution (12-bit = 4096)
+#define ENCODER_VALID_READS_REQUIRED 3 // Require consecutive good reads before steering is enabled
 //
 // HOW TO CALIBRATE ENCODER_ANGLE_OFFSET:
 // 1. Set ENCODER_ANGLE_OFFSET to 0 temporarily
@@ -181,6 +182,11 @@ int limitedSteeringPercent = 0;      // Steering % after speed-based limiting
 int rolloverSpeedLimit = 100;        // Current speed limit due to steering angle
 bool throttleHoldingHigh = false;   // Is throttle currently held high?
 uint32_t lastRcInputTime = 0;       // Last time we got RC input (steer2 or throttle2)
+
+// Steering encoder validity. Starts false on every boot and only becomes true
+// after consecutive successful AS5600 angle reads.
+bool encoderValid = false;
+uint8_t encoderGoodReadCount = 0;
 
 // Serial command buffer for ESP32 commands
 char cmdBuffer[64];
@@ -722,18 +728,20 @@ void readAS5600Angle(TelemetryData& td) {
     // 4096 counts = 360 degrees, so angle_degrees = (counts / 4096) * 360
     
     static bool i2cErrorReported = false;
-    static uint16_t lastValidAngle = 0;  // Remember last good reading (default to center)
+    static uint16_t lastValidAngle = 0;  // Last known angle is display-only when encoderValid is false
     
     Wire.beginTransmission(ENCODER_I2C_ADDR);
     Wire.write(0x0E);  // Angle register MSB
     byte error = Wire.endTransmission();
     
     if (error != 0) {
+        encoderValid = false;
+        encoderGoodReadCount = 0;
         if (!i2cErrorReported) {
             Serial.printf("I2C Error on transmission: %d (will not repeat)\n", error);
             i2cErrorReported = true;
         }
-        // Use last valid angle if I2C fails
+        // Keep last angle for display only; steering is disabled while encoderValid is false.
         td.encoderAngle = lastValidAngle;
         return;
     }
@@ -747,12 +755,23 @@ void readAS5600Angle(TelemetryData& td) {
         td.encoderAngle = (angleDeg + ENCODER_ANGLE_OFFSET) % 360;
         lastValidAngle = td.encoderAngle;
         i2cErrorReported = false;  // Reset flag when communication works
+
+        if (encoderGoodReadCount < ENCODER_VALID_READS_REQUIRED) {
+            encoderGoodReadCount++;
+        }
+        if (!encoderValid && encoderGoodReadCount >= ENCODER_VALID_READS_REQUIRED) {
+            encoderValid = true;
+            Serial.printf("[STEER] AS5600 VALID after %u consecutive angle reads - steering enabled\n",
+                          ENCODER_VALID_READS_REQUIRED);
+        }
     } else {
+        encoderValid = false;
+        encoderGoodReadCount = 0;
         if (!i2cErrorReported) {
             Serial.printf("I2C Error: No data from AS5600 (available: %d bytes)\n", Wire.available());
             i2cErrorReported = true;
         }
-        // Use last valid angle if I2C fails
+        // Keep last angle for display only; steering is disabled while encoderValid is false.
         td.encoderAngle = lastValidAngle;
     }
 }
@@ -1073,6 +1092,17 @@ void updateRCControls(TelemetryData& td) {
 // updateRCSteeringControls() - Steering control for RC mode (ignores shifter)
 //******************************************************************************
 void updateRCSteeringControls(TelemetryData& td) {
+    // Never steer from an assumed or stale encoder value.
+    if (!encoderValid) {
+        digitalWrite(PIN_STEER_L_EN, LOW);
+        digitalWrite(PIN_STEER_R_EN, LOW);
+        analogWrite(PIN_STEER_LPWM, 0);
+        analogWrite(PIN_STEER_RPWM, 0);
+        td.steerPwmL = 0;
+        td.steerPwmR = 0;
+        return;
+    }
+
     // RC steering - always enabled regardless of shifter position
     // steer2: -100 (left) to 0 (center) to +100 (right)
     
@@ -1140,6 +1170,17 @@ void updateRCSteeringControls(TelemetryData& td) {
 // updateSteeringControls() - Handle steering motor control
 //******************************************************************************
 void updateSteeringControls(TelemetryData& td) {
+    // Never steer from an assumed or stale encoder value.
+    if (!encoderValid) {
+        digitalWrite(PIN_STEER_L_EN, LOW);
+        digitalWrite(PIN_STEER_R_EN, LOW);
+        analogWrite(PIN_STEER_LPWM, 0);
+        analogWrite(PIN_STEER_RPWM, 0);
+        td.steerPwmL = 0;
+        td.steerPwmR = 0;
+        return;
+    }
+
     // Safety check: Only allow steering if shifter is engaged (FWD or REV)
     // In NEUTRAL, disable steering motor completely
     if (!td.shifterFwd && !td.shifterRev) {
