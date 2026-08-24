@@ -18,7 +18,7 @@
 //******************************************************************************
 // Version Information
 //******************************************************************************
-#define FIRMWARE_VERSION "1.8.11"
+#define FIRMWARE_VERSION "1.8.12"
 #define BUILD_DATE       __DATE__ " " __TIME__
 
 //******************************************************************************
@@ -39,14 +39,14 @@
 #define STEERING_FILTER_ALPHA 0.3     // Low-pass filter: 0.0-1.0 (lower = more filtering)
 
 // ----- STEERING MOTOR LIMITS (Encoder Angle in Degrees) -----
-// Center is 0° (raw encoder reading at straight wheels)
-// Range wraps around 360°/0° boundary: full left ~315°, full right ~45°
-#define STEER_ANGLE_CENTER    0       // Encoder angle when wheels point straight
-#define STEER_ANGLE_RANGE     45      // ± degrees from center (adjust for your steering linkage)
-#define STEER_ANGLE_MIN       (360 - STEER_ANGLE_RANGE)  // Full left (315°)
-#define STEER_ANGLE_MAX       STEER_ANGLE_RANGE           // Full right (45°)
+// Encoder offset is calibrated so straight wheels read approximately 180°.
+// Physical steering travel is intentionally asymmetric: left=132°, center=180°, right=225°.
+#define STEER_ANGLE_CENTER    180     // Encoder angle when wheels point straight
+#define STEER_ANGLE_RANGE     45      // Nominal range used by rollover protection
+#define STEER_ANGLE_MIN       132     // Full left physical target
+#define STEER_ANGLE_MAX       225     // Full right physical target
 #define STEER_MOTOR_SPEED     100     // PWM speed for steering (0-255)
-#define STEER_ANGLE_DEADBAND  15      // Stop motor when within ± this many degrees of target
+#define STEER_ANGLE_DEADBAND  3       // Stop motor when within ±3° of target
 
 // ----- THROTTLE POT (T1_WIPER) -----
 #define THROTTLE_POT_PIN      23      // Pin 23 (A9) - Throttle potentiometer
@@ -196,6 +196,15 @@ uint8_t encoderFaultCode = 0;
 // Serial command buffer for ESP32 commands
 char cmdBuffer[64];
 int cmdBufferIndex = 0;
+
+// Convert steering percentage to the calibrated, asymmetric encoder target.
+int steeringTargetFromPercent(int steeringPercent) {
+    steeringPercent = constrain(steeringPercent, -100, 100);
+    if (steeringPercent < 0) {
+        return map(steeringPercent, -100, 0, STEER_ANGLE_MIN, STEER_ANGLE_CENTER);
+    }
+    return map(steeringPercent, 0, 100, STEER_ANGLE_CENTER, STEER_ANGLE_MAX);
+}
 
 //******************************************************************************
 // setup()
@@ -475,7 +484,7 @@ int calculateRolloverProtection(int actualEncoderAngle) {
     }
     
     // Calculate how far we are from center (180° at straight wheels)
-    // Center is 180°, left is 135° (180-45), right is 225° (180+45)
+    // Center is 180°, left is 135° (nominal), right is 225°
     const int CENTER_ANGLE = 180;
     int angleFromCenter = actualEncoderAngle - CENTER_ANGLE;
     
@@ -628,8 +637,7 @@ void loop() {
         lastDebug = millis();
         
         TelemetryData& td = Telem.data();
-        int targetAngle = STEER_ANGLE_CENTER + (td.steeringPercent * STEER_ANGLE_RANGE) / 100;
-        targetAngle = constrain(targetAngle, STEER_ANGLE_MIN, STEER_ANGLE_MAX);
+        int targetAngle = steeringTargetFromPercent(td.steeringPercent);
         
         int angleError = targetAngle - td.encoderAngle;
         if (angleError > 180) angleError -= 360;
@@ -1167,22 +1175,8 @@ void updateRCSteeringControls(TelemetryData& td) {
     // RC steering - always enabled regardless of shifter position
     // steer2: -100 (left) to 0 (center) to +100 (right)
     
-    // Convert steer2 percentage to target angle
-    // Center=0°, Right=+45°, Left=-45° (which wraps to 315°)
-    int targetAngle = (td.steer2Percent * STEER_ANGLE_RANGE) / 100;
-    // Handle negative angles (wrap to 0-359 range)
-    if (targetAngle < 0) {
-        targetAngle += 360;
-    }
-    // Clamp to valid range: 0-45 or 315-359
-    if (targetAngle > STEER_ANGLE_MAX && targetAngle < STEER_ANGLE_MIN) {
-        // Outside valid range - clamp to nearest limit
-        if (targetAngle < 180) {
-            targetAngle = STEER_ANGLE_MAX;  // 45°
-        } else {
-            targetAngle = STEER_ANGLE_MIN;  // 315°
-        }
-    }
+    // Convert steer2 percentage to calibrated physical encoder target.
+    int targetAngle = steeringTargetFromPercent(td.steer2Percent);
     
     // Get current encoder angle
     int currentAngle = td.encoderAngle;
@@ -1198,9 +1192,8 @@ void updateRCSteeringControls(TelemetryData& td) {
     
     // Determine motor direction based on error
     static bool wasMovingRC = false;
-    // Check if at target (with deadband) OR if error is near wraparound ambiguity
+    // Stop at target; retain 180° ambiguity stop as a safety guard for impossible sensor geometry.
     if (abs(angleError) <= STEER_ANGLE_DEADBAND || abs(abs(angleError) - 180) < 5) {
-        // Within deadband OR at wraparound ambiguity - stop motor
         if (wasMovingRC) {
             wasMovingRC = false;
         }
@@ -1258,22 +1251,8 @@ void updateSteeringControls(TelemetryData& td) {
     // STEERING POT MODE: Use steering input to position motor
     // Encoder feedback drives motor to reach target position
     
-    // Convert steering percentage to target angle
-    // Center=0°, Right=+45°, Left=-45° (which wraps to 315°)
-    int targetAngle = (td.steeringPercent * STEER_ANGLE_RANGE) / 100;
-    // Handle negative angles (wrap to 0-359 range)
-    if (targetAngle < 0) {
-        targetAngle += 360;
-    }
-    // Clamp to valid range: 0-45 or 315-359
-    if (targetAngle > STEER_ANGLE_MAX && targetAngle < STEER_ANGLE_MIN) {
-        // Outside valid range - clamp to nearest limit
-        if (targetAngle < 180) {
-            targetAngle = STEER_ANGLE_MAX;  // 45°
-        } else {
-            targetAngle = STEER_ANGLE_MIN;  // 315°
-        }
-    }
+    // Convert steering percentage to calibrated physical encoder target.
+    int targetAngle = steeringTargetFromPercent(td.steeringPercent);
     
     // Get current encoder angle
     int currentAngle = td.encoderAngle;
@@ -1289,9 +1268,8 @@ void updateSteeringControls(TelemetryData& td) {
     
     // Determine motor direction based on error
     static bool wasMoving = false;
-    // Check if at target (with deadband) OR if error is near wraparound ambiguity
+    // Stop at target; retain 180° ambiguity stop as a safety guard for impossible sensor geometry.
     if (abs(angleError) <= STEER_ANGLE_DEADBAND || abs(abs(angleError) - 180) < 5) {
-        // Within deadband OR at wraparound ambiguity - stop motor
         if (wasMoving) {
             Serial.printf(">>> STEER MOTOR OFF - Target reached! Error: %d°\n", angleError);
             wasMoving = false;
@@ -1429,8 +1407,7 @@ void printPeripheralStatus() {
     TelemetryData& td = Telem.data();
     
     // Calculate target angle for display
-    int targetAngle = STEER_ANGLE_CENTER + (td.steeringPercent * STEER_ANGLE_RANGE) / 100;
-    targetAngle = constrain(targetAngle, STEER_ANGLE_MIN, STEER_ANGLE_MAX);
+    int targetAngle = steeringTargetFromPercent(td.steeringPercent);
     
     int angleError = targetAngle - td.encoderAngle;
     if (angleError > 180) angleError -= 360;
