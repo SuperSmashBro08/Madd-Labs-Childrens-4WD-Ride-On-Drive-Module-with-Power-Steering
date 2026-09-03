@@ -18,7 +18,7 @@
 //******************************************************************************
 // Version Information
 //******************************************************************************
-#define FIRMWARE_VERSION "1.8.12"
+#define FIRMWARE_VERSION "1.8.13"
 #define BUILD_DATE       __DATE__ " " __TIME__
 
 //******************************************************************************
@@ -115,8 +115,8 @@
 // ===== DIGITAL INPUTS (3.3V Logic) =====
 #define PIN_SHIFTER_FWD       29      // Shifter Forward (swapped)
 #define PIN_SHIFTER_REV       28      // Shifter Reverse (swapped)
-#define PIN_MODE_SELECT       30      // Mode Select
-#define PIN_EBRAKE            31      // E-Brake Input
+#define PIN_BRAKE_NC          30      // Brake microswitch NC contact
+#define PIN_BRAKE_NO          31      // Brake microswitch NO contact
 
 // ===== PWM OUTPUTS (3.3V) =====
 #define PIN_STEER_LPWM        2       // Steering LPWM
@@ -158,6 +158,20 @@
 #define SOFT_STOP_RATE       1      // Percentage to decrease per update cycle (lower = slower deceleration)
 #define SOFT_STOP_INTERVAL   30     // Milliseconds between ramp-down steps
 
+// Dual-contact brake input + progressive dynamic braking
+// Omron SPDT wiring: COM -> GND, NC -> D30, NO -> D31
+// INPUT_PULLUP truth table:
+//   D30 LOW,  D31 HIGH = released
+//   D30 HIGH, D31 LOW  = pressed
+//   D30 HIGH, D31 HIGH = invalid/open circuit
+//   D30 LOW,  D31 LOW  = invalid/shorted wiring
+#define BRAKE_FAULT_CONFIRM_MS       100
+#define BRAKE_RAMP_MS                600
+#define BRAKE_INITIAL_DUTY           25
+#define BRAKE_MAX_DUTY               100
+#define BRAKE_REARM_PEDAL_MAX        5
+#define BRAKE_REARM_RC_MAX           10
+
 // Rollover protection - limits throttle based on actual steering angle
 // The sharper the turn (based on encoder), the more throttle is limited
 #define ROLLOVER_STEER_THRESHOLD     20     // Steering angle % where throttle limiting begins (0-100)
@@ -194,6 +208,25 @@ uint8_t encoderGoodReadCount = 0;
 uint8_t encoderFailureCount = 0;
 bool encoderFaultLatched = false;
 uint8_t encoderFaultCode = 0;
+
+// Brake safety state
+enum BrakeInputState : uint8_t {
+    BRAKE_INPUT_RELEASED = 0,
+    BRAKE_INPUT_PRESSED  = 1,
+    BRAKE_INPUT_INVALID  = 2
+};
+
+BrakeInputState brakeInputState = BRAKE_INPUT_INVALID;
+bool brakeNcClosed = false;
+bool brakeNoClosed = false;
+bool brakeCommandActive = false;
+bool brakeFaultLatched = false;
+bool brakeRearmRequired = false;
+bool brakeInvalidTiming = false;
+bool brakeOutputsActive = false;
+uint32_t brakeInvalidStartTime = 0;
+uint32_t brakeCommandStartTime = 0;
+uint8_t currentBrakeDuty = 0;
 
 // Serial command buffer for ESP32 commands
 char cmdBuffer[64];
@@ -584,6 +617,16 @@ void processEsp32Commands() {
 //******************************************************************************
 void allMotorsOff() {
     TelemetryData& td = Telem.data();
+
+    // If dynamic braking had attached PWM to enable pins, return them to GPIO.
+    if (brakeOutputsActive) {
+        analogWrite(PIN_FRONT_L_EN, 0);
+        analogWrite(PIN_REAR_R_EN, 0);
+        pinMode(PIN_FRONT_L_EN, OUTPUT);
+        pinMode(PIN_REAR_R_EN, OUTPUT);
+        brakeOutputsActive = false;
+        currentBrakeDuty = 0;
+    }
     
     // Disable all enable pins - CRITICAL for backdrive prevention
     digitalWrite(PIN_STEER_L_EN, LOW);
@@ -608,6 +651,193 @@ void allMotorsOff() {
     td.frontPwmR = 0;
     td.rearPwmL = 0;
     td.rearPwmR = 0;
+}
+
+//******************************************************************************
+// releaseDynamicBrakeOutputs() - Return front/rear bridges to coast/off
+//******************************************************************************
+void releaseDynamicBrakeOutputs() {
+    if (!brakeOutputsActive) {
+        currentBrakeDuty = 0;
+        return;
+    }
+
+    // Stop PWM on the two enable pins, then return those pins to GPIO mode.
+    analogWrite(PIN_FRONT_L_EN, 0);
+    analogWrite(PIN_REAR_R_EN, 0);
+    pinMode(PIN_FRONT_L_EN, OUTPUT);
+    pinMode(PIN_REAR_R_EN, OUTPUT);
+
+    digitalWrite(PIN_FRONT_L_EN, LOW);
+    digitalWrite(PIN_FRONT_R_EN, LOW);
+    digitalWrite(PIN_REAR_L_EN, LOW);
+    digitalWrite(PIN_REAR_R_EN, LOW);
+
+    analogWrite(PIN_FRONT_LPWM, 0);
+    analogWrite(PIN_FRONT_RPWM, 0);
+    analogWrite(PIN_REAR_LPWM, 0);
+    analogWrite(PIN_REAR_RPWM, 0);
+
+    TelemetryData& td = Telem.data();
+    td.frontPwmL = 0;
+    td.frontPwmR = 0;
+    td.rearPwmL = 0;
+    td.rearPwmR = 0;
+
+    brakeOutputsActive = false;
+    currentBrakeDuty = 0;
+}
+
+//******************************************************************************
+// calculateBrakeDuty() - Smoothly ramp dynamic braking from initial to maximum
+//******************************************************************************
+uint8_t calculateBrakeDuty() {
+    if (!brakeCommandActive) {
+        return 0;
+    }
+
+    uint32_t elapsed = millis() - brakeCommandStartTime;
+    if (elapsed >= BRAKE_RAMP_MS) {
+        return BRAKE_MAX_DUTY;
+    }
+
+    uint32_t span = BRAKE_MAX_DUTY - BRAKE_INITIAL_DUTY;
+    uint32_t duty = BRAKE_INITIAL_DUTY + ((span * elapsed) / BRAKE_RAMP_MS);
+    return (uint8_t)constrain((int)duty, BRAKE_INITIAL_DUTY, BRAKE_MAX_DUTY);
+}
+
+//******************************************************************************
+// applyDynamicBrake() - PWM between dynamic BRAKE and COAST
+//
+// Both drive-direction PWM inputs are held LOW. With both BTS7960 enable inputs
+// HIGH, both motor terminals are pulled to the low side, producing dynamic
+// braking. One enable per bridge is PWM'd; its LOW portion opens the current
+// path and creates coast time. No reverse-drive command is used.
+//******************************************************************************
+void applyDynamicBrake(uint8_t dutyPercent) {
+    dutyPercent = constrain(dutyPercent, 0, 100);
+
+    if (!brakeOutputsActive) {
+        // Remove propulsion before establishing the braking current path.
+        digitalWrite(PIN_FRONT_L_EN, LOW);
+        digitalWrite(PIN_FRONT_R_EN, LOW);
+        digitalWrite(PIN_REAR_L_EN, LOW);
+        digitalWrite(PIN_REAR_R_EN, LOW);
+
+        analogWrite(PIN_FRONT_LPWM, 0);
+        analogWrite(PIN_FRONT_RPWM, 0);
+        analogWrite(PIN_REAR_LPWM, 0);
+        analogWrite(PIN_REAR_RPWM, 0);
+
+        brakeOutputsActive = true;
+    }
+
+    // Propulsion direction inputs stay at zero for the entire brake command.
+    analogWrite(PIN_FRONT_LPWM, 0);
+    analogWrite(PIN_FRONT_RPWM, 0);
+    analogWrite(PIN_REAR_LPWM, 0);
+    analogWrite(PIN_REAR_RPWM, 0);
+
+    // Fixed side enabled, opposite side PWM'd between BRAKE and COAST.
+    digitalWrite(PIN_FRONT_R_EN, HIGH);
+    digitalWrite(PIN_REAR_L_EN, HIGH);
+
+    int brakePwm = map(dutyPercent, 0, 100, 0, 255);
+    analogWrite(PIN_FRONT_L_EN, brakePwm);
+    analogWrite(PIN_REAR_R_EN, brakePwm);
+
+    currentDriveSpeed = 0;
+    currentDriveDirection = 0;
+    currentBrakeDuty = dutyPercent;
+
+    TelemetryData& td = Telem.data();
+    td.frontPwmL = 0;
+    td.frontPwmR = 0;
+    td.rearPwmL = 0;
+    td.rearPwmR = 0;
+}
+
+//******************************************************************************
+// updateBrakeInputs() - Decode redundant SPDT brake switch and detect faults
+//******************************************************************************
+void updateBrakeInputs(TelemetryData& td) {
+    uint32_t now = millis();
+
+    brakeNcClosed = (digitalRead(PIN_BRAKE_NC) == LOW);
+    brakeNoClosed = (digitalRead(PIN_BRAKE_NO) == LOW);
+
+    BrakeInputState newState;
+    if (brakeNcClosed && !brakeNoClosed) {
+        newState = BRAKE_INPUT_RELEASED;
+    } else if (!brakeNcClosed && brakeNoClosed) {
+        newState = BRAKE_INPUT_PRESSED;
+    } else {
+        newState = BRAKE_INPUT_INVALID;
+    }
+
+    bool wasBrakeActive = brakeCommandActive;
+
+    if (newState == BRAKE_INPUT_PRESSED) {
+        brakeInvalidTiming = false;
+        brakeCommandActive = true;
+        brakeRearmRequired = true;
+    }
+    else if (newState == BRAKE_INPUT_RELEASED) {
+        brakeInvalidTiming = false;
+        if (!brakeFaultLatched) {
+            brakeCommandActive = false;
+        }
+    }
+    else {
+        // Fail safe immediately for either impossible contact combination.
+        brakeCommandActive = true;
+
+        if (!brakeInvalidTiming) {
+            brakeInvalidTiming = true;
+            brakeInvalidStartTime = now;
+        }
+        else if (!brakeFaultLatched &&
+                 (now - brakeInvalidStartTime >= BRAKE_FAULT_CONFIRM_MS)) {
+            brakeFaultLatched = true;
+            brakeRearmRequired = true;
+
+            Serial.printf("[FAULT] BRAKE INPUT LATCHED - NC=%d NO=%d\n",
+                          brakeNcClosed ? 1 : 0,
+                          brakeNoClosed ? 1 : 0);
+            Serial3.printf("FAULT:BRAKE:INPUT NC=%d NO=%d\n",
+                           brakeNcClosed ? 1 : 0,
+                           brakeNoClosed ? 1 : 0);
+        }
+    }
+
+    // A confirmed wiring fault never self-clears. Reboot is required.
+    if (brakeFaultLatched) {
+        brakeCommandActive = true;
+    }
+
+    if (!wasBrakeActive && brakeCommandActive) {
+        brakeCommandStartTime = now;
+        currentBrakeDuty = BRAKE_INITIAL_DUTY;
+
+        Serial.printf("[BRAKE] ENGAGED - state=%s NC=%d NO=%d\n",
+                      newState == BRAKE_INPUT_PRESSED ? "PRESSED" : "INVALID",
+                      brakeNcClosed ? 1 : 0,
+                      brakeNoClosed ? 1 : 0);
+
+        // Apply the first braking stage before the blocking RC pulse reads.
+        applyDynamicBrake(BRAKE_INITIAL_DUTY);
+    }
+    else if (wasBrakeActive && !brakeCommandActive) {
+        Serial.println("[BRAKE] RELEASED - drive locked until throttle neutral");
+        releaseDynamicBrakeOutputs();
+    }
+
+    brakeInputState = newState;
+
+    // Preserve the existing telemetry structure: eBrake reports active brake.
+    // modeSelect is repurposed to expose the latched brake-input fault state.
+    td.modeSelect = brakeFaultLatched;
+    td.eBrake = brakeCommandActive;
 }
 
 //******************************************************************************
@@ -658,6 +888,13 @@ void loop() {
         Serial.printf("Throttle1: %3d%% | Steer2: %3d%% (raw=%4d) | Throttle2: %3d%% (raw=%4d) | RC Mode: %s\n",
                      td.throttlePercent, td.steer2Percent, td.steer2Raw, td.throttle2Percent, td.throttle2Raw,
                      rcModeActive ? "ACTIVE" : "inactive");
+        Serial.printf("Brake: %s | NC=%d NO=%d | Duty=%3d%% | Fault=%s | Rearm=%s\n",
+                     brakeCommandActive ? "ACTIVE" : "off",
+                     brakeNcClosed ? 1 : 0,
+                     brakeNoClosed ? 1 : 0,
+                     currentBrakeDuty,
+                     brakeFaultLatched ? "LATCHED" : "none",
+                     brakeRearmRequired ? "WAIT_NEUTRAL" : "ready");
     }
     
     // Heartbeat (for ESP32 connection monitoring)
@@ -851,6 +1088,9 @@ void readInputs() {
     // Read analog inputs
     td.steeringRaw = analogRead(PIN_STEERING_POT);
     td.throttleRaw = analogRead(PIN_THROTTLE_POT);
+
+    // Read redundant brake contacts before the blocking RC pulse reads.
+    updateBrakeInputs(td);
     
     // Read RC inputs (PWM servo signals - measure pulse width in microseconds)
     // Typical RC PWM: 1000µs = min, 1500µs = center, 2000µs = max
@@ -875,10 +1115,6 @@ void readInputs() {
     td.shifterFwd = (fwdPin == LOW);   // Forward: FWD pin is pulled LOW
     td.shifterRev = (revPin == LOW);   // Reverse: REV pin is pulled LOW
     // Note: Neutral = both pins HIGH (shifterFwd==false AND shifterRev==false)
-    
-    // Other digital inputs (inverted logic for non-shifter)
-    td.modeSelect = !digitalRead(PIN_MODE_SELECT);
-    td.eBrake = !digitalRead(PIN_EBRAKE);
     
     // Calculate processed values
     // Steering: map raw to -100 to +100 with deadzone
@@ -974,8 +1210,8 @@ void initPeripherals() {
     // Configure digital inputs with internal pullups
     pinMode(PIN_SHIFTER_FWD, INPUT_PULLUP);
     pinMode(PIN_SHIFTER_REV, INPUT_PULLUP);
-    pinMode(PIN_MODE_SELECT, INPUT_PULLUP);
-    pinMode(PIN_EBRAKE, INPUT_PULLUP);
+    pinMode(PIN_BRAKE_NC, INPUT_PULLUP);
+    pinMode(PIN_BRAKE_NO, INPUT_PULLUP);
     
     // Configure PWM outputs
     pinMode(PIN_STEER_LPWM, OUTPUT);
@@ -1000,6 +1236,12 @@ void initPeripherals() {
     analogWriteFrequency(PIN_FRONT_RPWM, MOTOR_PWM_FREQ);
     analogWriteFrequency(PIN_REAR_LPWM, MOTOR_PWM_FREQ);
     analogWriteFrequency(PIN_REAR_RPWM, MOTOR_PWM_FREQ);
+
+    // Progressive brake uses hardware PWM on these enable pins. Use the same
+    // 20 kHz frequency as the drive outputs so shared PWM timer groups remain
+    // at a consistent frequency.
+    analogWriteFrequency(PIN_FRONT_L_EN, MOTOR_PWM_FREQ);
+    analogWriteFrequency(PIN_REAR_R_EN, MOTOR_PWM_FREQ);
     
     // Start with all outputs off
     analogWrite(PIN_STEER_LPWM, 0);
@@ -1018,6 +1260,7 @@ void initPeripherals() {
     
     Serial.println("Peripherals initialized");
     Serial.printf("  PWM frequency: %d Hz\n", MOTOR_PWM_FREQ);
+    Serial.println("  Brake wiring: COM=GND, NC=D30, NO=D31");
 }
 
 //******************************************************************************
@@ -1026,13 +1269,73 @@ void initPeripherals() {
 void updatePeripherals() {
     TelemetryData& td = Telem.data();
 
-    // Confirmed encoder faults are latched until reboot. For this revision there
-    // is intentionally no RC limp-home override yet, so every motor stays off.
+    // Confirmed encoder faults are latched until reboot. The drive brake remains
+    // available even if steering feedback is lost.
     if (encoderFaultLatched) {
         currentDriveSpeed = 0;
         currentDriveDirection = 0;
-        allMotorsOff();
+
+        if (brakeCommandActive) {
+            applyDynamicBrake(calculateBrakeDuty());
+
+            // Encoder is invalid, so steering must remain disabled.
+            digitalWrite(PIN_STEER_L_EN, LOW);
+            digitalWrite(PIN_STEER_R_EN, LOW);
+            analogWrite(PIN_STEER_LPWM, 0);
+            analogWrite(PIN_STEER_RPWM, 0);
+            td.steerPwmL = 0;
+            td.steerPwmR = 0;
+        } else {
+            releaseDynamicBrakeOutputs();
+            allMotorsOff();
+        }
+
         td.controlSource = rcModeActive ? 2 : 1;
+        return;
+    }
+
+    // BRAKE HAS ABSOLUTE DRIVE PRIORITY. Steering remains available.
+    if (brakeCommandActive) {
+        applyDynamicBrake(calculateBrakeDuty());
+        td.controlSource = rcModeActive ? 2 : 1;
+
+        if (rcModeActive) {
+            updateRCSteeringControls(td);
+        } else {
+            updateSteeringControls(td);
+        }
+        return;
+    }
+
+    // If braking just ended, restore PWM'd enable pins to ordinary GPIO.
+    if (brakeOutputsActive) {
+        releaseDynamicBrakeOutputs();
+    }
+
+    // After a brake press, propulsion cannot resume until BOTH possible
+    // throttle sources are neutral. This prevents a brake-release launch.
+    if (brakeRearmRequired) {
+        driveFrontMotor(0, 0);
+        driveRearMotor(0, 0);
+        currentDriveSpeed = 0;
+        currentDriveDirection = 0;
+
+        bool pedalNeutral = (td.throttlePercent <= BRAKE_REARM_PEDAL_MAX);
+        bool rcNeutral = (abs(td.throttle2Percent) <= BRAKE_REARM_RC_MAX);
+
+        if (pedalNeutral && rcNeutral) {
+            brakeRearmRequired = false;
+            Serial.println("[BRAKE] RE-ARMED - throttle neutral, drive enabled");
+            Serial3.println("BRAKE:REARMED");
+        }
+
+        td.controlSource = rcModeActive ? 2 : 1;
+
+        if (rcModeActive) {
+            updateRCSteeringControls(td);
+        } else {
+            updateSteeringControls(td);
+        }
         return;
     }
     
@@ -1432,8 +1735,15 @@ void printPeripheralStatus() {
     Serial.printf("  Target:    %3d deg\n", targetAngle);
     Serial.printf("  Error:     %4d deg\n", angleError);
     Serial.printf("  Shifter:   %s\n", td.shifterFwd ? "FWD" : (td.shifterRev ? "REV" : "NEUTRAL"));
-    Serial.printf("  Mode:      %s\n", td.modeSelect ? "ON" : "OFF");
-    Serial.printf("  E-Brake:   %s\n", td.eBrake ? "ENGAGED" : "OFF");
+    Serial.printf("  Brake NC:  %s (D30)\n", brakeNcClosed ? "CLOSED/GND" : "OPEN");
+    Serial.printf("  Brake NO:  %s (D31)\n", brakeNoClosed ? "CLOSED/GND" : "OPEN");
+    Serial.printf("  Brake:     %s  duty=%u%%\n",
+                  brakeCommandActive ? "ENGAGED" : "OFF",
+                  currentBrakeDuty);
+    Serial.printf("  Brake fault: %s\n",
+                  brakeFaultLatched ? "LATCHED - REBOOT REQUIRED" : "none");
+    Serial.printf("  Brake rearm: %s\n",
+                  brakeRearmRequired ? "WAITING FOR THROTTLE NEUTRAL" : "ready");
     
     Serial.println("--- Outputs ---");
     Serial.printf("  Steer PWM: L=%3d  R=%3d\n", td.steerPwmL, td.steerPwmR);
@@ -1484,6 +1794,9 @@ void heartbeat() {
         Serial3.println("heartbeat");
         if (encoderFaultLatched) {
             Serial3.printf("FAULT:ENCODER:%u\n", encoderFaultCode);
+        }
+        if (brakeFaultLatched) {
+            Serial3.println("FAULT:BRAKE:INPUT");
         }
         lastHeartbeat = millis();
     }
